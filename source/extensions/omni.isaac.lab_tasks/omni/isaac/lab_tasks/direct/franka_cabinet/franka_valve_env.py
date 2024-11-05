@@ -65,7 +65,7 @@ class EventCfg:
                            "y": (-0.1, 0.1),
                            "z": (-0.1, 0.1),
                            "roll": (-0.349, 0.349),
-                           "pitch": (-0.785, 0.785),  # 45 deg
+                           "pitch": (0, 1.57),  # 45 deg
                            "yaw": (-0.349, 0.349),  # 20 deg
                            },
             "velocity_range": {}
@@ -78,9 +78,9 @@ class FrankaValveEnvCfg(DirectRLEnvCfg):
     # env
     episode_length_s = 8.3333  # 500 timesteps
     decimation = 2
-    num_actions = 9
-    num_observations = 23
-    num_states = 0
+    action_space = 9
+    observation_space = 23
+    state_space = 0
 
     # simulation
     sim: SimulationCfg = SimulationCfg(
@@ -106,7 +106,8 @@ class FrankaValveEnvCfg(DirectRLEnvCfg):
     robot = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{ISAAC_NUCLEUS_DIR}/Robots/Franka/franka_instanceable.usd",
+            # usd_path=f"{ISAAC_NUCLEUS_DIR}/Robots/Franka/franka_instanceable.usd",
+            usd_path=f"{ISAAC_NUCLEUS_DIR}/IsaacLab/Robots/FrankaEmika/panda_instanceable.usd",
             activate_contact_sensors=False,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
@@ -167,24 +168,26 @@ class FrankaValveEnvCfg(DirectRLEnvCfg):
     valve = ArticulationCfg(
         prim_path="/World/envs/env_.*/Valve",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=f"/home/kist-robot2/Desktop/round_only/round_only_instanceable.usd",
+            usd_path=f"/home/kist-robot2/Desktop/round_valve_align/round_valve_align.usd",
             activate_contact_sensors=False,
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 0, 0.4),
             # rot=(0.0, 0.0, 0.0, 1.0),
-            rot=(0.6532815, 0.2705981, -0.2705981, -0.6532815),  # (w, x, y, z)
+            rot=(1, 0, 0, 0),
+            # rot=(0.6532815, 0.2705981, -0.2705981, -0.6532815),  # (w, x, y, z)
             joint_pos={
-                "latch_joint": 0.0,
+                "valve_joint": 0.0,
             },
         ),
         actuators={
             "joint": ImplicitActuatorCfg(
-                joint_names_expr=["latch_joint"],
+                # NOTE: Used only when we apply a specific control.
+                joint_names_expr=["valve_joint"],
                 effort_limit=87.0,
                 velocity_limit=100.0,
-                # stiffness=1.0,
-                damping=0.0,
+                stiffness=80.0,
+                damping=4.0,
             ),
         },
     )
@@ -203,6 +206,7 @@ class FrankaValveEnvCfg(DirectRLEnvCfg):
         ),
     )
 
+    # NOTE: We have to use below terms through `self.cfg.~`
     action_scale = 7.5
     dof_velocity_scale = 0.1
 
@@ -259,6 +263,7 @@ class FrankaValveEnv(DirectRLEnv):
         self.robot_dof_targets = torch.zeros((self.num_envs, self._robot.num_joints), device=self.device)
 
         stage = get_current_stage()
+        # NOTE: 'local_pose' is a fixed frame in the environment.
         hand_pose = get_env_local_pose(
             self.scene.env_origins[0],
             UsdGeom.Xformable(stage.GetPrimAtPath("/World/envs/env_0/Robot/panda_link7")),
@@ -275,11 +280,14 @@ class FrankaValveEnv(DirectRLEnv):
             self.device,
         )
 
+        # NOTE: 'finger_pose' is a transformation from "world" to "finger"
         finger_pose = torch.zeros(7, device=self.device)
-        finger_pose[0:3] = (lfinger_pose[0:3] + rfinger_pose[0:3]) / 2.0
+        finger_pose[0:3] = (lfinger_pose[0:3] + rfinger_pose[0:3]) / 2.0  # NOTE: Isn't it useless?
         finger_pose[3:7] = lfinger_pose[3:7]
+        # NOTE: 'hand_pose_inv' is a transformation from "hand" to "world"
         hand_pose_inv_rot, hand_pose_inv_pos = tf_inverse(hand_pose[3:7], hand_pose[0:3])
 
+        # NOTE: "hand" to "world" + "world" to "finger" => "hand" to "finger"
         robot_local_grasp_pose_rot, robot_local_pose_pos = tf_combine(
             hand_pose_inv_rot, hand_pose_inv_pos, finger_pose[3:7], finger_pose[0:3]
         )
@@ -438,6 +446,7 @@ class FrankaValveEnv(DirectRLEnv):
         hand_rot = self._robot.data.body_quat_w[env_ids, self.hand_link_idx]
         # drawer_pos = self._cabinet.data.body_pos_w[env_ids, self.drawer_link_idx]
         # drawer_rot = self._cabinet.data.body_quat_w[env_ids, self.drawer_link_idx]
+        # # NOTE: Following outputs are transformations from "world" frame.
         # (
         #     self.robot_grasp_rot[env_ids],
         #     self.robot_grasp_pos[env_ids],
@@ -528,6 +537,8 @@ class FrankaValveEnv(DirectRLEnv):
     #     drawer_local_grasp_rot,
     #     drawer_local_grasp_pos,
     # ):
+    #     # NOTE: 'hand_pose' = "world" to "hand", 'franka_local_grasp_pose' = "hand" to "finger"
+    #     # NOTE: So we can make "world" to "finger" transformation using `tf_combine` function.
     #     global_franka_rot, global_franka_pos = tf_combine(
     #         hand_rot, hand_pos, franka_local_grasp_rot, franka_local_grasp_pos
     #     )
