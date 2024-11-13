@@ -343,11 +343,19 @@ class FrankaValveEnv(DirectRLEnv):
     # pre-physics step calls
 
     def _pre_physics_step(self, actions: torch.Tensor):
+        """ Pre-process actions before stepping through the physics.
+            It is called before the physics stepping (which is decimated).  """
         self.actions = actions.clone().clamp(-1.0, 1.0)
         targets = self.robot_dof_targets + self.robot_dof_speed_scales * self.dt * self.actions * self.cfg.action_scale
         self.robot_dof_targets[:] = torch.clamp(targets, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
 
     def _apply_action(self):
+        """ Apply actions to the simulator.
+            It is called at each physics time-step.
+
+            This function does not apply the joint targets to the simulation.
+            It only fills the buffers with the desired values.
+            To apply the joint targets, call the write_data_to_sim() function.  """
         self._robot.set_joint_position_target(self.robot_dof_targets)
 
     # post-physics step calls
@@ -434,6 +442,10 @@ class FrankaValveEnv(DirectRLEnv):
             ),
             dim=-1,
         )
+        """ A dictionary should be returned that contains policy as the key,
+            and the full observation buffer as the value.
+            For asymmetric policies,
+            the dictionary should also include the key critic and the states buffer as the value.   """
         return {"policy": torch.clamp(obs, -5.0, 5.0)}
 
     # auxiliary methods
