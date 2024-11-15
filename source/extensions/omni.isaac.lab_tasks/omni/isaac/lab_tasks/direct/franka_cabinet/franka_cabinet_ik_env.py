@@ -23,7 +23,7 @@ from omni.isaac.lab.utils.assets import ISAAC_NUCLEUS_DIR
 from omni.isaac.lab.utils.math import sample_uniform
 from omni.isaac.lab.controllers import DifferentialIKController, DifferentialIKControllerCfg
 from omni.isaac.lab.managers import SceneEntityCfg
-from omni.isaac.lab.utils.math import subtract_frame_transforms, quat_from_euler_xyz
+from omni.isaac.lab.utils.math import subtract_frame_transforms, quat_from_euler_xyz, euler_xyz_from_quat
 
 
 @configclass
@@ -32,7 +32,7 @@ class FrankaCabinetIKEnvCfg(DirectRLEnvCfg):
     episode_length_s = 8.3333  # 500 timesteps
     decimation = 2
     action_space = 7  # 6 pose + 1 gripper
-    observation_space = 23
+    observation_space = 14  # Robot pose (6) + Cabinet handle pose (6) + Gripper (2)
     state_space = 0
 
     # simulation
@@ -165,6 +165,13 @@ class FrankaCabinetIKEnvCfg(DirectRLEnvCfg):
     finger_reward_scale = 2.0
 
 
+def _get_pose_b(obj_w, base_w):
+    obj_pos_b, obj_quat_b = subtract_frame_transforms(
+        base_w[:, 0:3], base_w[:, 3:7], obj_w[:, 0:3], obj_w[:, 3:7]
+    )
+    return obj_pos_b, obj_quat_b
+
+
 class FrankaCabinetIKEnv(DirectRLEnv):
     # pre-physics step calls
     #   |-- _pre_physics_step(action)
@@ -275,7 +282,8 @@ class FrankaCabinetIKEnv(DirectRLEnv):
 
         self.diff_ik_cfg = DifferentialIKControllerCfg(command_type="pose", use_relative_mode=True, ik_method="dls")
         self.diff_ik_controller = DifferentialIKController(self.diff_ik_cfg, num_envs=self.scene.num_envs, device=self.device)
-        self.cmd_limit = torch.tensor([0.1, 0.1, 0.1, 0.5, 0.5, 0.5], device=self.device)
+        # self.cmd_limit = torch.tensor([0.1, 0.1, 0.1, 0.5, 0.5, 0.5], device=self.device)
+        self.cmd_limit = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], device=self.device)
         self.ik_commands = torch.zeros(self.scene.num_envs, self.diff_ik_controller.action_dim, device=self.device)
 
 
@@ -304,8 +312,8 @@ class FrankaCabinetIKEnv(DirectRLEnv):
         d_arm, d_gripper = self.actions[:, :-1], self.actions[:, -1]  # dpose
         d_arm *= self.cmd_limit
         arm_targets = self._compute_osc_torques(d_arm)
-        gripper_targets = torch.where(d_gripper > 0, 1, -1).unsqueeze(1).repeat(1,2)
-        targets = torch.concat([arm_targets, gripper_targets], -1)
+        self.gripper_targets = torch.where(d_gripper > 0, 1, -1).unsqueeze(1).repeat(1,2)
+        targets = torch.concat([arm_targets, self.gripper_targets], -1)
         self.robot_dof_targets[:] = torch.clamp(targets, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
 
     def _compute_osc_torques(self, dpose):
@@ -314,13 +322,11 @@ class FrankaCabinetIKEnv(DirectRLEnv):
         # d_quat = quat_from_euler_xyz(*d_angle.T)
         # dpose = torch.concat([d_pos, d_quat], dim=-1)
         jacobian = self._robot.root_physx_view.get_jacobians()[:, self.ee_jacobi_idx, :, self.robot_entity_cfg.joint_ids]
-        ee_pose_w = self._robot.data.body_state_w[:, self.robot_entity_cfg.body_ids[0], 0:7]
-        root_pose_w = self._robot.data.root_state_w[:, 0:7]
         joint_pos = self._robot.data.joint_pos[:, self.robot_entity_cfg.joint_ids]
         # compute frame in root frame
-        ee_pos_b, ee_quat_b = subtract_frame_transforms(
-            root_pose_w[:, 0:3], root_pose_w[:, 3:7], ee_pose_w[:, 0:3], ee_pose_w[:, 3:7]
-        )
+        ee_pose_w = self._robot.data.body_state_w[:, self.robot_entity_cfg.body_ids[0], 0:7]
+        base_pose_w = self._robot.data.root_state_w[:, 0:7]
+        ee_pos_b, ee_quat_b = _get_pose_b(ee_pose_w, base_pose_w)
         # compute the joint commands
         self.diff_ik_controller.reset()
         self.diff_ik_controller.set_command(dpose, ee_pos_b, ee_quat_b)
@@ -388,21 +394,19 @@ class FrankaCabinetIKEnv(DirectRLEnv):
         self._compute_intermediate_values(env_ids)
 
     def _get_observations(self) -> dict:
-        dof_pos_scaled = (
-            2.0
-            * (self._robot.data.joint_pos - self.robot_dof_lower_limits)
-            / (self.robot_dof_upper_limits - self.robot_dof_lower_limits)
-            - 1.0
-        )
-        to_target = self.drawer_grasp_pos - self.robot_grasp_pos
+        ee_pose_w = self._robot.data.body_state_w[:, self.robot_entity_cfg.body_ids[0], 0:7]
+        base_pose_w = self._robot.data.root_state_w[:, 0:7]
+        ee_pos_b, ee_quat_b = _get_pose_b(ee_pose_w, base_pose_w)
+        drawer_pose_w = torch.cat([self.drawer_grasp_pos, self.drawer_grasp_rot], dim=-1)
+        drawer_pos_b, drawer_quat_b = _get_pose_b(drawer_pose_w, base_pose_w)
 
         obs = torch.cat(
             (
-                dof_pos_scaled,
-                self._robot.data.joint_vel * self.cfg.dof_velocity_scale,
-                to_target,
-                self._cabinet.data.joint_pos[:, 3].unsqueeze(-1),
-                self._cabinet.data.joint_vel[:, 3].unsqueeze(-1),
+                ee_pos_b,                                           # 3
+                torch.stack(euler_xyz_from_quat(ee_quat_b)).T,      # 3
+                drawer_pos_b,                                       # 3
+                torch.stack(euler_xyz_from_quat(drawer_quat_b)).T,  # 3
+                self._robot.data.joint_pos[:, -2:]                  # 2
             ),
             dim=-1,
         )
@@ -482,7 +486,7 @@ class FrankaCabinetIKEnv(DirectRLEnv):
         # how far the cabinet has been opened out
         # finger_closed = (franka_lfinger_pos[:, 2] - franka_rfinger_pos[:, 2]) < 0.025
         # open_reward = finger_closed.int() * cabinet_dof_pos[:, 3]
-        # open_reward = -self.actions[:, -1] * cabinet_dof_pos[:, 3]
+        # open_reward = -self.gripper_targets[:, -1] * cabinet_dof_pos[:, 3]
         open_reward = cabinet_dof_pos[:, 3]  # drawer_top_joint
 
         # penalty for distance of each finger from the drawer handle
@@ -503,7 +507,7 @@ class FrankaCabinetIKEnv(DirectRLEnv):
             + open_reward_scale * open_reward
             + finger_reward_scale * finger_dist_penalty
             - action_penalty_scale * action_penalty
-            - 2.0 * finger_align_penalty
+            - 1.0 * finger_align_penalty
         )
 
         self.extras["log"] = {
@@ -519,6 +523,8 @@ class FrankaCabinetIKEnv(DirectRLEnv):
 
         # bonus for opening drawer properly
         rewards = torch.where(cabinet_dof_pos[:, 3] > 0.01, rewards + 0.25, rewards)
+        rewards = torch.where(cabinet_dof_pos[:, 3] > 0.05, rewards + 0.25, rewards)
+        rewards = torch.where(cabinet_dof_pos[:, 3] > 0.1, rewards + 0.25, rewards)
         rewards = torch.where(cabinet_dof_pos[:, 3] > 0.2, rewards + 0.25, rewards)
         rewards = torch.where(cabinet_dof_pos[:, 3] > 0.35, rewards + 0.25, rewards)
         rewards = torch.where(cabinet_dof_pos[:, 3] > 0.38, rewards + 0.25, rewards)
