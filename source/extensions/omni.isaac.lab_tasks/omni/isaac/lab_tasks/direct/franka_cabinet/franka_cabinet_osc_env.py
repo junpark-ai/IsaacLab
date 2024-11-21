@@ -21,13 +21,13 @@ from omni.isaac.lab.terrains import TerrainImporterCfg
 from omni.isaac.lab.utils import configclass
 from omni.isaac.lab.utils.assets import ISAAC_NUCLEUS_DIR
 from omni.isaac.lab.utils.math import sample_uniform
-from omni.isaac.lab.controllers import DifferentialIKController, DifferentialIKControllerCfg
+from omni.isaac.lab.controllers import OperationSpaceController, OperationSpaceControllerCfg
 from omni.isaac.lab.managers import SceneEntityCfg
-from omni.isaac.lab.utils.math import subtract_frame_transforms, quat_from_euler_xyz, euler_xyz_from_quat
+from omni.isaac.lab.utils.math import subtract_frame_transforms, quat_from_euler_xyz, euler_xyz_from_quat, matrix_from_quat
 
 
 @configclass
-class FrankaCabinetIKEnvCfg(DirectRLEnvCfg):
+class FrankaCabinetOSCEnvCfg(DirectRLEnvCfg):
     # env
     episode_length_s = 8.3333  # 500 timesteps
     decimation = 2
@@ -68,13 +68,21 @@ class FrankaCabinetIKEnvCfg(DirectRLEnvCfg):
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             joint_pos={
-                "panda_joint1": 1.157,
-                "panda_joint2": -1.066,
-                "panda_joint3": -0.155,
-                "panda_joint4": -2.239,
-                "panda_joint5": -1.841,
-                "panda_joint6": 1.003,
-                "panda_joint7": 0.469,
+                # "panda_joint1": 1.157,
+                # "panda_joint2": -1.066,
+                # "panda_joint3": -0.155,
+                # "panda_joint4": -2.239,
+                # "panda_joint5": -1.841,
+                # "panda_joint6": 1.003,
+                # "panda_joint7": 0.469,
+                # "panda_finger_joint.*": 0.035,
+                "panda_joint1": 0,
+                "panda_joint2": 0.1963,
+                "panda_joint3": 0,
+                "panda_joint4": -2.6180,
+                "panda_joint5": 0,
+                "panda_joint6": 2.9416,
+                "panda_joint7": 0.7854,
                 "panda_finger_joint.*": 0.035,
             },
             pos=(1.0, 0.0, 0.0),
@@ -172,7 +180,7 @@ def _get_pose_b(obj_w, base_w):
     return obj_pos_b, obj_quat_b
 
 
-class FrankaCabinetIKEnv(DirectRLEnv):
+class FrankaCabinetOSCEnv(DirectRLEnv):
     # pre-physics step calls
     #   |-- _pre_physics_step(action)
     #   |-- _apply_action()
@@ -182,9 +190,9 @@ class FrankaCabinetIKEnv(DirectRLEnv):
     #   |-- _reset_idx(env_ids)
     #   |-- _get_observations()
 
-    cfg: FrankaCabinetIKEnvCfg
+    cfg: FrankaCabinetOSCEnvCfg
 
-    def __init__(self, cfg: FrankaCabinetIKEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: FrankaCabinetOSCEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
         def get_env_local_pose(env_pos: torch.Tensor, xformable: UsdGeom.Xformable, device: torch.device):
@@ -213,7 +221,8 @@ class FrankaCabinetIKEnv(DirectRLEnv):
         self.robot_dof_speed_scales[self._robot.find_joints("panda_finger_joint1")[0]] = 0.1
         self.robot_dof_speed_scales[self._robot.find_joints("panda_finger_joint2")[0]] = 0.1
 
-        self.robot_dof_targets = torch.zeros((self.num_envs, self._robot.num_joints), device=self.device)
+        self.robot_torque_targets = torch.zeros((self.num_envs, self._robot.num_joints - 2), device=self.device)
+        self.robot_pos_targets = torch.zeros((self.num_envs, 2), device=self.device)
 
         stage = get_current_stage()
         hand_pose = get_env_local_pose(
@@ -271,7 +280,7 @@ class FrankaCabinetIKEnv(DirectRLEnv):
         self.drawer_grasp_rot = torch.zeros((self.num_envs, 4), device=self.device)
         self.drawer_grasp_pos = torch.zeros((self.num_envs, 3), device=self.device)
 
-        # For IK controller
+        # For OSC controller
 
         self.robot_entity_cfg = SceneEntityCfg("robot", joint_names=["panda_joint.*"], body_names=["panda_hand"])
         self.robot_entity_cfg.resolve(self.scene)
@@ -280,11 +289,26 @@ class FrankaCabinetIKEnv(DirectRLEnv):
         else:
             self.ee_jacobi_idx = self.robot_entity_cfg.body_ids[0]
 
-        self.diff_ik_cfg = DifferentialIKControllerCfg(command_type="pose", use_relative_mode=True, ik_method="dls")
-        self.diff_ik_controller = DifferentialIKController(self.diff_ik_cfg, num_envs=self.scene.num_envs, device=self.device)
+        self.osc_cfg = OperationSpaceControllerCfg(
+            command_types=["pose_rel"],  # TODO
+            impedance_mode="fixed",
+            # motion_control_axes=(0, 0, 0, 0, 0, 0),
+            # force_control_axes=(1, 1, 1, 1, 1, 1),
+            stiffness=[80.] * 6,
+            damping_ratio=[4.] * 6,
+            # force_stiffness=[150. * 6],  # TODO
+            inertial_compensation=True,
+            gravity_compensation=True,
+        )
+        self.osc_controller = OperationSpaceController(
+            self.osc_cfg,
+            num_robots=self.scene.num_envs,
+            num_dof=7,
+            device=self.device
+        )
         # self.cmd_limit = torch.tensor([0.1, 0.1, 0.1, 0.5, 0.5, 0.5], device=self.device)
         self.cmd_limit = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], device=self.device)
-        self.ik_commands = torch.zeros(self.scene.num_envs, self.diff_ik_controller.action_dim, device=self.device)
+        self.osc_commands = torch.zeros(self.scene.num_envs, self.osc_controller.target_dim, device=self.device)
 
 
     def _setup_scene(self):
@@ -311,30 +335,84 @@ class FrankaCabinetIKEnv(DirectRLEnv):
         self.actions = actions.clone()
         d_arm, d_gripper = self.actions[:, :-1], self.actions[:, -1]  # dpose
         d_arm *= self.cmd_limit
-        arm_targets = self._compute_osc_torques(d_arm)
+        torque_targets = self._compute_osc_torques(d_arm)
         self.gripper_targets = torch.where(d_gripper > 0, 1, -1).unsqueeze(1).repeat(1,2)
-        targets = torch.concat([arm_targets, self.gripper_targets], -1)
-        self.robot_dof_targets[:] = torch.clamp(targets, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
+        # pos_targets = torch.concat([arm_targets, self.gripper_targets], -1)
+        self.robot_pos_targets = torch.clamp(
+            self.gripper_targets,
+            self.robot_dof_lower_limits[-2:], self.robot_dof_upper_limits[-2:]
+        )
+        self.robot_torque_targets = torch.clamp(
+            torque_targets,
+            -torch.tensor([87] * 4 + [12] * 3).to(self.device), torch.tensor([87] * 4 + [12] * 3).to(self.device)
+        )
+        # self.robot_torque_targets[:, :-2] = torque_targets
 
     def _compute_osc_torques(self, dpose):
-        # # Only needed when ``use_relative_mode=False`` in ``DifferentialIKControllerCfg``
-        # d_pos, d_angle = dpose[:, :3], dpose[:, 3:]
-        # d_quat = quat_from_euler_xyz(*d_angle.T)
-        # dpose = torch.concat([d_pos, d_quat], dim=-1)
-        jacobian = self._robot.root_physx_view.get_jacobians()[:, self.ee_jacobi_idx, :, self.robot_entity_cfg.joint_ids]
-        joint_pos = self._robot.data.joint_pos[:, self.robot_entity_cfg.joint_ids]
-        # compute frame in root frame
-        ee_pose_w = self._robot.data.body_state_w[:, self.robot_entity_cfg.body_ids[0], 0:7]
-        base_pose_w = self._robot.data.root_state_w[:, 0:7]
-        ee_pos_b, ee_quat_b = _get_pose_b(ee_pose_w, base_pose_w)
-        # compute the joint commands
-        self.diff_ik_controller.reset()
-        self.diff_ik_controller.set_command(dpose, ee_pos_b, ee_quat_b)
-        joint_pos_des = self.diff_ik_controller.compute(ee_pos_b, ee_quat_b, jacobian, joint_pos)
-        return joint_pos_des
+        q = self._robot.data.joint_pos[:, :7]
+        qd = self._robot.data.joint_vel[:, :7]
+        j_eef = self._robot.root_physx_view.get_jacobians()[:, self.ee_jacobi_idx, :, self.robot_entity_cfg.joint_ids]
+        mm = self._robot.root_physx_view.get_mass_matrices()[:, :7, :7]
+        mm_inv = torch.inverse(mm)
+        m_eef_inv = j_eef @ mm_inv @ torch.transpose(j_eef, 1, 2)
+        m_eef = torch.inverse(m_eef_inv)
+
+        # Transform our cartesian action `dpose` into joint torques `u`
+        kp = torch.tensor([150.] * 6, device=self.device)
+        kd = 2 * torch.sqrt(kp)
+        kp_null = torch.tensor([10.] * 7, device=self.device)
+        kd_null = 2 * torch.sqrt(kp_null)
+        ee_vel_w = self._robot.root_physx_view.get_link_velocities()[:, self.ee_jacobi_idx + 1, :]
+        # base_rotm_w = matrix_from_quat(self._robot.data.root_state_w[:, 3:7])
+        base_rotm_w = matrix_from_quat(self._robot.data.body_quat_w[:, self.ee_jacobi_idx + 1, :])
+        ee_vel_lin_b = (base_rotm_w @ ee_vel_w[:, :3].unsqueeze(-1)).squeeze(-1)
+        ee_vel_ang_b = (base_rotm_w @ ee_vel_w[:, 3:].unsqueeze(-1)).squeeze(-1)
+        ee_vel_b = torch.cat((ee_vel_lin_b, ee_vel_ang_b), dim=-1)
+        u = torch.transpose(j_eef, 1, 2) @ m_eef @ (
+                kp * dpose - kd * ee_vel_b).unsqueeze(-1)
+
+        # Nullspace control torques `u_null` prevents large changes in joint configuration
+        # They are added into the nullspace of OSC so that the end effector orientation remains constant
+        # roboticsproceedings.org/rss07/p31.pdf
+        j_eef_inv = m_eef @ j_eef @ mm_inv
+        u_null = kd_null * -qd + kp_null * (
+                (self._robot.data.default_joint_pos[0, :7] - q + torch.pi) % (2 * torch.pi) - torch.pi)
+        u_null[:, 7:] *= 0
+        u_null = mm @ u_null.unsqueeze(-1)
+        u += (torch.eye(7, device=self.device).unsqueeze(0) - torch.transpose(j_eef, 1, 2) @ j_eef_inv) @ u_null
+
+        return u.squeeze(-1)
+
+    # def _compute_osc_torques(self, dpose):
+    #     jacobian = self._robot.root_physx_view.get_jacobians()[:, self.ee_jacobi_idx, :, self.robot_entity_cfg.joint_ids]
+    #     # inv_j = jacobian.permute(0, 2, 1) @ torch.inverse(jacobian @ jacobian.permute(0, 2, 1))
+    #     # ee_force = (inv_j.permute(0,2,1) @ self._robot.data.applied_torque[:, :7].unsqueeze(-1)).squeeze(-1)
+    #     ee_vel_w = self._robot.root_physx_view.get_link_velocities()[:, self.ee_jacobi_idx + 1, :]
+    #     ee_vel_quat_w = torch.cat((ee_vel_w[:, :3], quat_from_euler_xyz(*ee_vel_w[:, 3:].T)), dim=-1)
+    #     mass_matrix = self._robot.root_physx_view.get_mass_matrices()[:, :7, :7]
+    #     gravity = self._robot.root_physx_view.get_generalized_gravity_forces()[:, self.robot_entity_cfg.joint_ids]
+    #     # compute frame in root frame
+    #     ee_pose_w = self._robot.data.body_state_w[:, self.robot_entity_cfg.body_ids[0], 0:7]
+    #     base_pose_w = self._robot.data.root_state_w[:, 0:7]
+    #     ee_pose_b = torch.cat(_get_pose_b(ee_pose_w, base_pose_w), dim=-1)
+    #     ee_vel_quat_b = torch.cat(_get_pose_b(ee_vel_quat_w, base_pose_w), dim=-1)
+    #     ee_vel_b = torch.cat((ee_vel_quat_b[:, :3], torch.stack(euler_xyz_from_quat(ee_vel_quat_b[:, 3:])).T), dim=-1)
+    #     # compute the joint commands
+    #     # self.osc_controller.reset()
+    #     self.osc_controller.set_command(dpose)
+    #     joint_torque_des = self.osc_controller.compute(
+    #         jacobian=jacobian,
+    #         ee_pose=ee_pose_b,  # TODO
+    #         ee_vel=ee_vel_b,
+    #         # ee_force=ee_force[:, :3],
+    #         mass_matrix=mass_matrix,
+    #         gravity=gravity,
+    #     )
+    #     return joint_torque_des
 
     def _apply_action(self):
-        self._robot.set_joint_position_target(self.robot_dof_targets)
+        self._robot.set_joint_effort_target(target=self.robot_torque_targets, joint_ids=[i for i in range(7)])
+        self._robot.set_joint_position_target(target=self.robot_pos_targets, joint_ids=[7, 8])
 
     # post-physics step calls
 
