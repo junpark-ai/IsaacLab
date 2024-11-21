@@ -289,26 +289,8 @@ class FrankaCabinetOSCEnv(DirectRLEnv):
         else:
             self.ee_jacobi_idx = self.robot_entity_cfg.body_ids[0]
 
-        self.osc_cfg = OperationSpaceControllerCfg(
-            command_types=["pose_rel"],  # TODO
-            impedance_mode="fixed",
-            # motion_control_axes=(0, 0, 0, 0, 0, 0),
-            # force_control_axes=(1, 1, 1, 1, 1, 1),
-            stiffness=[80.] * 6,
-            damping_ratio=[4.] * 6,
-            # force_stiffness=[150. * 6],  # TODO
-            inertial_compensation=True,
-            gravity_compensation=True,
-        )
-        self.osc_controller = OperationSpaceController(
-            self.osc_cfg,
-            num_robots=self.scene.num_envs,
-            num_dof=7,
-            device=self.device
-        )
         # self.cmd_limit = torch.tensor([0.1, 0.1, 0.1, 0.5, 0.5, 0.5], device=self.device)
         self.cmd_limit = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], device=self.device)
-        self.osc_commands = torch.zeros(self.scene.num_envs, self.osc_controller.target_dim, device=self.device)
 
 
     def _setup_scene(self):
@@ -382,33 +364,6 @@ class FrankaCabinetOSCEnv(DirectRLEnv):
         u += (torch.eye(7, device=self.device).unsqueeze(0) - torch.transpose(j_eef, 1, 2) @ j_eef_inv) @ u_null
 
         return u.squeeze(-1)
-
-    # def _compute_osc_torques(self, dpose):
-    #     jacobian = self._robot.root_physx_view.get_jacobians()[:, self.ee_jacobi_idx, :, self.robot_entity_cfg.joint_ids]
-    #     # inv_j = jacobian.permute(0, 2, 1) @ torch.inverse(jacobian @ jacobian.permute(0, 2, 1))
-    #     # ee_force = (inv_j.permute(0,2,1) @ self._robot.data.applied_torque[:, :7].unsqueeze(-1)).squeeze(-1)
-    #     ee_vel_w = self._robot.root_physx_view.get_link_velocities()[:, self.ee_jacobi_idx + 1, :]
-    #     ee_vel_quat_w = torch.cat((ee_vel_w[:, :3], quat_from_euler_xyz(*ee_vel_w[:, 3:].T)), dim=-1)
-    #     mass_matrix = self._robot.root_physx_view.get_mass_matrices()[:, :7, :7]
-    #     gravity = self._robot.root_physx_view.get_generalized_gravity_forces()[:, self.robot_entity_cfg.joint_ids]
-    #     # compute frame in root frame
-    #     ee_pose_w = self._robot.data.body_state_w[:, self.robot_entity_cfg.body_ids[0], 0:7]
-    #     base_pose_w = self._robot.data.root_state_w[:, 0:7]
-    #     ee_pose_b = torch.cat(_get_pose_b(ee_pose_w, base_pose_w), dim=-1)
-    #     ee_vel_quat_b = torch.cat(_get_pose_b(ee_vel_quat_w, base_pose_w), dim=-1)
-    #     ee_vel_b = torch.cat((ee_vel_quat_b[:, :3], torch.stack(euler_xyz_from_quat(ee_vel_quat_b[:, 3:])).T), dim=-1)
-    #     # compute the joint commands
-    #     # self.osc_controller.reset()
-    #     self.osc_controller.set_command(dpose)
-    #     joint_torque_des = self.osc_controller.compute(
-    #         jacobian=jacobian,
-    #         ee_pose=ee_pose_b,  # TODO
-    #         ee_vel=ee_vel_b,
-    #         # ee_force=ee_force[:, :3],
-    #         mass_matrix=mass_matrix,
-    #         gravity=gravity,
-    #     )
-    #     return joint_torque_des
 
     def _apply_action(self):
         self._robot.set_joint_effort_target(target=self.robot_torque_targets, joint_ids=[i for i in range(7)])
