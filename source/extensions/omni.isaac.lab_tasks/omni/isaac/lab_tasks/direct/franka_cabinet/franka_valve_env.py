@@ -33,7 +33,8 @@ class EventCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names="panda_joint[1357]"),
-            "position_range": (-0.5, 0.5),
+            # "position_range": (0, 0),
+            "position_range": (-0.1, 0.1),
             "velocity_range": (0, 0)
         }
     )
@@ -42,7 +43,8 @@ class EventCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names="panda_joint[246]"),
-            "position_range": (-0.3, 0.3),
+            # "position_range": (0, 0),
+            "position_range": (-0.1, 0.1),
             "velocity_range": (0, 0)
         }
     )
@@ -53,7 +55,8 @@ class EventCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("valve", joint_names=".*"),
-            "position_range": (-0.5, 0.5),
+            "position_range": (0, 0),
+            # "position_range": (-0.5, 0.5),
             "velocity_range": (0, 0)
         }
     )
@@ -62,13 +65,20 @@ class EventCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("valve", body_names=".*"),
-            "pose_range": {"x": (-0.1, 0.1),
-                           "y": (-0.1, 0.1),
-                           "z": (-0.1, 0.1),
-                           "roll": (-0.349, 0.349),
-                           "pitch": (0, 1.57),  # 45 deg
-                           "yaw": (-0.349, 0.349),  # 20 deg
-                           },
+            "pose_range": {
+                "x": (0, 0),
+                "y": (0, 0),
+                "z": (0, 0),
+                "roll": (0, 0),
+                "pitch": (0, 0),  # 45 deg
+                "yaw": (0, 0),  # 20 deg
+                # "x": (-0.1, 0.1),
+                # "y": (-0.1, 0.1),
+                # "z": (-0.1, 0.1),
+                # "roll": (-0.349, 0.349),
+                # "pitch": (0, 1.57),  # 45 deg
+                # "yaw": (-0.349, 0.349),  # 20 deg
+            },
             "velocity_range": {}
         }
     )
@@ -120,22 +130,22 @@ class FrankaValveEnvCfg(DirectRLEnvCfg):
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             joint_pos={
-                # "panda_joint1": 1.157,
-                # "panda_joint2": -1.066,
-                # "panda_joint3": -0.155,
-                # "panda_joint4": -2.239,
-                # "panda_joint5": -1.841,
-                # "panda_joint6": 1.003,
-                # "panda_joint7": 0.469,
-                # "panda_finger_joint.*": 0.035,
-                "panda_joint1": 0,
-                "panda_joint2": 0,
-                "panda_joint3": 0,
-                "panda_joint4": (-0.0698 - 3.0718) / 2,  # -1.5708
-                "panda_joint5": 0,
-                "panda_joint6": (3.7525 - 0.0175) / 2,  # 1.8675
-                "panda_joint7": 0,
+                "panda_joint1": 1.157,
+                "panda_joint2": -1.066,
+                "panda_joint3": -0.155,
+                "panda_joint4": -2.239,
+                "panda_joint5": -1.841,
+                "panda_joint6": 1.003,
+                "panda_joint7": 0.469,
                 "panda_finger_joint.*": 0.035,
+                # "panda_joint1": 0,
+                # "panda_joint2": 0,
+                # "panda_joint3": 0,
+                # "panda_joint4": (-0.0698 - 3.0718) / 2,  # -1.5708
+                # "panda_joint5": 0,
+                # "panda_joint6": (3.7525 - 0.0175) / 2,  # 1.8675
+                # "panda_joint7": 0,
+                # "panda_finger_joint.*": 0.035,
             },
             pos=(0.5, 0.0, 0.0),
             rot=(0.0, 0.0, 0.0, 1.0),
@@ -214,8 +224,8 @@ class FrankaValveEnvCfg(DirectRLEnvCfg):
     # TODO
     # reward scales
     dist_reward_scale = 1.5
-    rot_reward_scale = 1.5
-    open_reward_scale = 10.0
+    rot_reward_scale = 3.0
+    open_reward_scale = 1.0
     action_penalty_scale = 0.05
     finger_reward_scale = 2.0
 
@@ -438,8 +448,8 @@ class FrankaValveEnv(DirectRLEnv):
     def _get_rewards(self) -> torch.Tensor:  # TODO
         # Refresh the intermediate values after the physics steps
         self._compute_intermediate_values()
-        robot_left_finger_pos = self._robot.data.body_pos_w[:, self.left_finger_link_idx]
-        robot_right_finger_pos = self._robot.data.body_pos_w[:, self.right_finger_link_idx]
+        robot_left_finger_pose = self._robot.data.body_state_w[:, self.left_finger_link_idx][:, :7]
+        robot_right_finger_pose = self._robot.data.body_state_w[:, self.right_finger_link_idx][:, :7]
 
         return self._compute_rewards(
             self.actions,
@@ -449,8 +459,8 @@ class FrankaValveEnv(DirectRLEnv):
             self.robot_grasp_rot,
             self.valve_center_pos,
             self.valve_center_rot,
-            robot_left_finger_pos,
-            robot_right_finger_pos,
+            robot_left_finger_pose,
+            robot_right_finger_pose,
             self.gripper_forward_axis,
             self.valve_inward_axis,
             self.gripper_up_axis,
@@ -525,8 +535,8 @@ class FrankaValveEnv(DirectRLEnv):
         robot_grasp_rot,
         valve_center_pos,
         valve_center_rot,
-        robot_lfinger_pos,
-        robot_rfinger_pos,
+        robot_lfinger_pose,
+        robot_rfinger_pose,
         gripper_forward_axis,
         valve_inward_axis,
         gripper_up_axis,
@@ -541,11 +551,15 @@ class FrankaValveEnv(DirectRLEnv):
     ):
         # distance from hand to the valve in z axis
         robot_grasp_pos_v, _ = _get_pose_b(
-            torch.cat((valve_center_pos, valve_center_rot), dim=-1),
-            torch.cat((robot_grasp_pos, robot_grasp_rot), dim=-1)
+            torch.cat((robot_grasp_pos, robot_grasp_rot), dim=-1),
+            torch.cat((valve_center_pos, valve_center_rot), dim=-1)
         )
-        d = torch.norm(robot_grasp_pos_v[:, -1], p=2, dim=-1)
-        dist_reward = 1.0 / (1.0 + d**2)
+        d_xy = torch.norm(robot_grasp_pos_v[:, :-1], p=2, dim=-1) - 0.11  # radius = 0.11
+        d_z = torch.abs(robot_grasp_pos_v[:, -1]) * 5
+        d = d_xy ** 2 + d_z ** 2
+        # d = torch.norm(robot_grasp_pos_v[:, -1], p=2, dim=-1)
+        dist_reward = 1.0 / (1.0 + d)
+        # dist_reward = 1.0 / (1.0 + d**2)
         dist_reward *= dist_reward
         dist_reward = torch.where(d <= 0.02, dist_reward * 2, dist_reward)
 
@@ -561,7 +575,7 @@ class FrankaValveEnv(DirectRLEnv):
         #     torch.bmm(axis3.view(num_envs, 1, 3), axis4.view(num_envs, 3, 1)).squeeze(-1).squeeze(-1)
         # )  # alignment of up axis for gripper
         # reward for matching the orientation of the hand to the drawer (fingers wrapped)
-        rot_reward = 1.0 * (torch.sign(dot1))
+        rot_reward = 1.0 * (torch.sign(dot1) * dot1**2)
         # rot_reward = 0.5 * (torch.sign(dot1) * dot1**2 + torch.sign(dot2) * dot2**2)
 
         # regularization on the actions (summed for each environment)
@@ -571,17 +585,25 @@ class FrankaValveEnv(DirectRLEnv):
         open_reward = valve_init_state - valve_dof_pos.squeeze(-1)
 
         # # penalty for distance of each finger from the drawer handle
-        # lfinger_dist = robot_lfinger_pos[:, 2] - drawer_grasp_pos[:, 2]
-        # rfinger_dist = drawer_grasp_pos[:, 2] - robot_rfinger_pos[:, 2]
-        # finger_dist_penalty = torch.zeros_like(lfinger_dist)
-        # finger_dist_penalty += torch.where(lfinger_dist < 0, lfinger_dist, torch.zeros_like(lfinger_dist))
-        # finger_dist_penalty += torch.where(rfinger_dist < 0, rfinger_dist, torch.zeros_like(rfinger_dist))
+        robot_lfinger_pos_v, _ = _get_pose_b(
+            robot_lfinger_pose,
+            torch.cat((valve_center_pos, valve_center_rot), dim=-1)
+        )
+        robot_rfinger_pos_v, _ = _get_pose_b(
+            robot_rfinger_pose,
+            torch.cat((valve_center_pos, valve_center_rot), dim=-1)
+        )
+        lfinger_dist = torch.norm(robot_lfinger_pos_v[:, :2], p=2, dim=-1) - 0.11
+        rfinger_dist = 0.11 - torch.norm(robot_rfinger_pos_v[:, :2], p=2, dim=-1)
+        finger_dist_penalty = torch.zeros_like(lfinger_dist)
+        finger_dist_penalty += torch.where(lfinger_dist < 0, lfinger_dist, torch.zeros_like(lfinger_dist))
+        finger_dist_penalty += torch.where(rfinger_dist < 0, rfinger_dist, torch.zeros_like(rfinger_dist))
 
         rewards = (
             dist_reward_scale * dist_reward
             + rot_reward_scale * rot_reward
             + open_reward_scale * open_reward
-            # + finger_reward_scale * finger_dist_penalty
+            + finger_reward_scale * finger_dist_penalty
             - action_penalty_scale * action_penalty
         )
 
@@ -590,9 +612,9 @@ class FrankaValveEnv(DirectRLEnv):
             "rot_reward": (rot_reward_scale * rot_reward).mean(),
             "open_reward": (open_reward_scale * open_reward).mean(),
             "action_penalty": (-action_penalty_scale * action_penalty).mean(),
-            # "left_finger_distance_reward": (finger_reward_scale * lfinger_dist).mean(),
-            # "right_finger_distance_reward": (finger_reward_scale * rfinger_dist).mean(),
-            # "finger_dist_penalty": (finger_reward_scale * finger_dist_penalty).mean(),
+            "left_finger_dist": (finger_reward_scale * lfinger_dist).mean(),
+            "right_finger_dist": (finger_reward_scale * rfinger_dist).mean(),
+            "finger_dist_penalty": (finger_reward_scale * finger_dist_penalty).mean(),
         }
 
         # bonus for opening drawer properly
