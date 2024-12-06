@@ -13,7 +13,7 @@ from .franka_cabinet_env import FrankaCabinetEnv, FrankaCabinetEnvCfg
 from .franka_cabinet_ik_env import FrankaCabinetIKEnv, FrankaCabinetIKEnvCfg
 from .franka_cabinet_osc_env import FrankaCabinetOSCEnv, FrankaCabinetOSCEnvCfg
 from .franka_valve_env import FrankaValveEnv, FrankaValveEnvCfg
-from .franka_valve_fix_rot_env import FrankaValveFixRotEnv, FrankaValveFixRotEnvCfg
+from .franka_valve_grasp_env import FrankaValveGraspEnv, FrankaValveGraspEnvCfg
 
 ##
 # Register Gym environments.
@@ -69,11 +69,11 @@ gym.register(
 
 gym.register(
     id="Isaac-Franka-Valve-Direct-v1",
-    entry_point="omni.isaac.lab_tasks.direct.franka_cabinet:FrankaValveFixRotEnv",
+    entry_point="omni.isaac.lab_tasks.direct.franka_cabinet:FrankaValveGraspEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": FrankaValveFixRotEnvCfg,
-        "rl_games_cfg_entry_point": f"{agents.__name__}:VALVE_rl_games_ppo_cfg.yaml",
+        "env_cfg_entry_point": FrankaValveGraspEnvCfg,
+        "rl_games_cfg_entry_point": f"{agents.__name__}:VALVE_Grasp_rl_games_ppo_cfg.yaml",
         # "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FrankaCabinetPPORunnerCfg",
         # "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
     },
