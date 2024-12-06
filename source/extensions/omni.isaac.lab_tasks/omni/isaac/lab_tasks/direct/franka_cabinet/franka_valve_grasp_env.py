@@ -23,7 +23,11 @@ from omni.isaac.lab.utils.assets import ISAAC_NUCLEUS_DIR
 from omni.isaac.lab.utils.math import sample_uniform
 from omni.isaac.lab.managers import EventTermCfg
 from omni.isaac.lab.managers import SceneEntityCfg
-from omni.isaac.lab.utils.math import subtract_frame_transforms, euler_xyz_from_quat, matrix_from_quat
+from omni.isaac.lab.controllers import DifferentialIKController, DifferentialIKControllerCfg
+from omni.isaac.lab.utils.math import subtract_frame_transforms, euler_xyz_from_quat, matrix_from_quat, quat_mul, quat_from_matrix
+
+from spatialmath import UnitQuaternion, SE3
+from roboticstoolbox import ctraj
 
 @configclass
 class EventCfg:
@@ -85,7 +89,7 @@ class EventCfg:
 
 
 @configclass
-class FrankaValveFixRotEnvCfg(DirectRLEnvCfg):
+class FrankaValveGraspEnvCfg(DirectRLEnvCfg):
     # env
     episode_length_s = 8.3333  # 500 timesteps
     decimation = 2
@@ -155,15 +159,15 @@ class FrankaValveFixRotEnvCfg(DirectRLEnvCfg):
                 joint_names_expr=["panda_joint[1-4]"],
                 effort_limit=87.0,
                 velocity_limit=2.175,
-                stiffness=80.0,
-                damping=4.0,
+                stiffness=400.0,
+                damping=40.0,
             ),
             "panda_forearm": ImplicitActuatorCfg(
                 joint_names_expr=["panda_joint[5-7]"],
                 effort_limit=12.0,
                 velocity_limit=2.61,
-                stiffness=80.0,
-                damping=4.0,
+                stiffness=400.0,
+                damping=40.0,
             ),
             "panda_hand": ImplicitActuatorCfg(
                 joint_names_expr=["panda_finger_joint.*"],
@@ -236,8 +240,25 @@ def _get_pose_b(obj_w, base_w):
     )
     return obj_pos_b, obj_quat_b
 
+def matrix_from_pose(trans, quat):
+    n_envs = trans.shape[0]
+    T = SE3.Alloc(n_envs)
+    trans, quat = trans.cpu().numpy(), quat.cpu().numpy()
+    for i in range(n_envs):
+        T[i] = SE3(trans[i]) * UnitQuaternion(quat[i]).SE3()
+    return T
 
-class FrankaValveFixRotEnv(DirectRLEnv):
+def make_traj(T_init, T_des, step):
+    n_envs = len(T_init)
+    trajs = torch.zeros(n_envs, step, 7)
+    for i in range(n_envs):
+        trajs[i] = torch.cat([torch.cat([torch.from_numpy(traj[:3, 3]).unsqueeze(0),
+                                         quat_from_matrix(torch.from_numpy(traj[:3, :3])).unsqueeze(0)], dim=-1)
+                              for traj in ctraj(T_init[i], T_des[i], step).data])
+    return trajs
+
+
+class FrankaValveGraspEnv(DirectRLEnv):
     # pre-physics step calls
     #   |-- _pre_physics_step(action)
     #   |-- _apply_action()
@@ -247,9 +268,9 @@ class FrankaValveFixRotEnv(DirectRLEnv):
     #   |-- _reset_idx(env_ids)
     #   |-- _get_observations()
 
-    cfg: FrankaValveFixRotEnvCfg
+    cfg: FrankaValveGraspEnvCfg
 
-    def __init__(self, cfg: FrankaValveFixRotEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: FrankaValveGraspEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
         def get_env_local_pose(env_pos: torch.Tensor, xformable: UsdGeom.Xformable, device: torch.device):
@@ -342,7 +363,7 @@ class FrankaValveFixRotEnv(DirectRLEnv):
 
         self.valve_init_state = torch.zeros((self.num_envs), device=self.device)
 
-        # For OSC controller
+        # For IK controller
 
         self.robot_entity_cfg = SceneEntityCfg("robot", joint_names=["panda_joint.*"], body_names=["panda_hand"])
         self.robot_entity_cfg.resolve(self.scene)
@@ -351,8 +372,27 @@ class FrankaValveFixRotEnv(DirectRLEnv):
         else:
             self.ee_jacobi_idx = self.robot_entity_cfg.body_ids[0]
 
+        self.diff_ik_cfg = DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls")
+        self.diff_ik_controller = DifferentialIKController(self.diff_ik_cfg, num_envs=self.scene.num_envs, device=self.device)
         # self.cmd_limit = torch.tensor([0.1, 0.1, 0.1, 0.5, 0.5, 0.5], device=self.device)
         self.cmd_limit = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], device=self.device)
+        self.ik_commands = torch.zeros(self.scene.num_envs, self.diff_ik_controller.action_dim, device=self.device)
+
+        self.base_pose_w = torch.zeros(self.scene.num_envs, 7, device=self.device)
+        self.ee_pose_w = torch.zeros(self.scene.num_envs, 7, device=self.device)
+        self.ee_pos_b = torch.zeros(self.scene.num_envs, 3, device=self.device)
+        self.ee_quat_b = torch.zeros(self.scene.num_envs, 4, device=self.device)
+        self.valve_pose_w = torch.zeros(self.scene.num_envs, 7, device=self.device)
+        self.valve_pos_b = torch.zeros(self.scene.num_envs, 3, device=self.device)
+        self.valve_quat_b = torch.zeros(self.scene.num_envs, 4, device=self.device)
+
+        self.jacobian = torch.zeros(self.scene.num_envs, 6, 7, device=self.device)
+        self.joint_pos = torch.zeros(self.scene.num_envs, 7, device=self.device)
+
+        self.traj_cnt = 0
+        self.traj_t = 300
+        self.trajs = torch.zeros(self.scene.num_envs, self.traj_t, 7, device=self.device)
+
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
@@ -377,56 +417,29 @@ class FrankaValveFixRotEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor):
         """ Pre-process actions before stepping through the physics.
             It is called before the physics stepping (which is decimated).  """
-        self.actions = actions.clone()
-        d_arm, d_gripper = self.actions[:, :-1], self.actions[:, -1]  # dpose
-        d_arm *= self.cmd_limit
-        torque_targets = self._compute_osc_torques(d_arm)
-        self.gripper_targets = torch.where(d_gripper > 0, 1, -1).unsqueeze(1).repeat(1, 2)
-        # pos_targets = torch.concat([arm_targets, self.gripper_targets], -1)
-        self.robot_pos_targets = torch.clamp(
-            self.gripper_targets,
-            self.robot_dof_lower_limits[-2:], self.robot_dof_upper_limits[-2:]
-        )
-        self.robot_torque_targets = torch.clamp(
-            torque_targets,
-            -torch.tensor([87] * 4 + [12] * 3).to(self.device), torch.tensor([87] * 4 + [12] * 3).to(self.device)
-        )
-        # self.robot_torque_targets[:, :-2] = torque_targets
+        # self.actions = actions.clone()
+        # d_arm, d_gripper = self.actions[:, :-1], self.actions[:, -1]  # dpose
+        # d_arm *= self.cmd_limit
+        arm_targets = self._compute_osc_torques()
+        # self.gripper_targets = torch.where(d_gripper > 0, 1, -1).unsqueeze(1).repeat(1,2)
+        self.gripper_targets = torch.zeros(self.num_envs, 1).to(self.device).repeat(1,2)
+        targets = torch.concat([arm_targets, self.gripper_targets], -1)
+        self.robot_dof_targets[:] = torch.clamp(targets, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
 
-    def _compute_osc_torques(self, dpose):
-        q = self._robot.data.joint_pos[:, :7]
-        qd = self._robot.data.joint_vel[:, :7]
-        j_eef = self._robot.root_physx_view.get_jacobians()[:, self.ee_jacobi_idx, :, self.robot_entity_cfg.joint_ids]
-        mm = self._robot.root_physx_view.get_mass_matrices()[:, :7, :7]
-        mm_inv = torch.inverse(mm)
-        m_eef_inv = j_eef @ mm_inv @ torch.transpose(j_eef, 1, 2)
-        m_eef = torch.inverse(m_eef_inv)
+    def _compute_osc_torques(self):
+        # # Only needed when ``use_relative_mode=False`` in ``DifferentialIKControllerCfg``
+        # d_pos, d_angle = dpose[:, :3], dpose[:, 3:]
+        # d_quat = quat_from_euler_xyz(*d_angle.T)
+        # dpose = torch.concat([d_pos, d_quat], dim=-1)
+        # compute the joint commands
+        self.diff_ik_controller.reset()
+        # self.diff_ik_controller.set_command(dpose, ee_pos_b, ee_quat_b)
+        self.diff_ik_controller.set_command(self.trajs[:, self.traj_cnt, :])
+        joint_pos_des = self.diff_ik_controller.compute(self.ee_pos_b, self.ee_quat_b, self.jacobian, self.joint_pos)
+        if self.traj_cnt < self.traj_t - 1:
+            self.traj_cnt += 1
 
-        # Transform our cartesian action `dpose` into joint torques `u`
-        kp = torch.tensor([150.] * 6, device=self.device)
-        kd = 2 * torch.sqrt(kp)
-        kp_null = torch.tensor([10.] * 7, device=self.device)
-        kd_null = 2 * torch.sqrt(kp_null)
-        ee_vel_w = self._robot.root_physx_view.get_link_velocities()[:, self.ee_jacobi_idx + 1, :]
-        # base_rotm_w = matrix_from_quat(self._robot.data.root_state_w[:, 3:7])
-        base_rotm_w = matrix_from_quat(self._robot.data.body_quat_w[:, self.ee_jacobi_idx + 1, :])
-        ee_vel_lin_b = (base_rotm_w @ ee_vel_w[:, :3].unsqueeze(-1)).squeeze(-1)
-        ee_vel_ang_b = (base_rotm_w @ ee_vel_w[:, 3:].unsqueeze(-1)).squeeze(-1)
-        ee_vel_b = torch.cat((ee_vel_lin_b, ee_vel_ang_b), dim=-1)
-        u = torch.transpose(j_eef, 1, 2) @ m_eef @ (
-                kp * dpose - kd * ee_vel_b).unsqueeze(-1)
-
-        # Nullspace control torques `u_null` prevents large changes in joint configuration
-        # They are added into the nullspace of OSC so that the end effector orientation remains constant
-        # roboticsproceedings.org/rss07/p31.pdf
-        j_eef_inv = m_eef @ j_eef @ mm_inv
-        u_null = kd_null * -qd + kp_null * (
-                (self._robot.data.default_joint_pos[0, :7] - q + torch.pi) % (2 * torch.pi) - torch.pi)
-        u_null[:, 7:] *= 0
-        u_null = mm @ u_null.unsqueeze(-1)
-        u += (torch.eye(7, device=self.device).unsqueeze(0) - torch.transpose(j_eef, 1, 2) @ j_eef_inv) @ u_null
-
-        return u.squeeze(-1)
+        return joint_pos_des
 
     def _apply_action(self):
         """ Apply actions to the simulator.
@@ -435,8 +448,7 @@ class FrankaValveFixRotEnv(DirectRLEnv):
             This function does not apply the joint targets to the simulation.
             It only fills the buffers with the desired values.
             To apply the joint targets, call the write_data_to_sim() function.  """
-        self._robot.set_joint_effort_target(target=self.robot_torque_targets, joint_ids=[i for i in range(7)])
-        self._robot.set_joint_position_target(target=self.robot_pos_targets, joint_ids=[7, 8])
+        self._robot.set_joint_position_target(self.robot_dof_targets)
 
     # post-physics step calls
 
@@ -480,6 +492,13 @@ class FrankaValveFixRotEnv(DirectRLEnv):
 
         # Need to refresh the intermediate values so that _get_observations() can use the latest values
         self._compute_intermediate_values(env_ids)
+
+        # Trajectory planning for each environment
+        self.traj_cnt = 0
+        ee_mat = matrix_from_pose(self.ee_pos_b, self.ee_quat_b)
+        des_mat = matrix_from_pose(self.valve_pos_b, self.valve_quat_b)
+        self.trajs = make_traj(ee_mat, des_mat, self.traj_t).to(self.device)
+
 
     def _get_observations(self) -> dict:
         ee_pose_w = self._robot.data.body_state_w[:, self.robot_entity_cfg.body_ids[0], 0:7]
@@ -525,6 +544,16 @@ class FrankaValveFixRotEnv(DirectRLEnv):
             self.robot_local_grasp_rot[env_ids],
             self.robot_local_grasp_pos[env_ids],
         )
+
+        self.jacobian = self._robot.root_physx_view.get_jacobians()[:, self.ee_jacobi_idx, :, self.robot_entity_cfg.joint_ids]
+        self.joint_pos = self._robot.data.joint_pos[:, self.robot_entity_cfg.joint_ids]
+
+        # For trajectory planning
+        self.base_pose_w = self._robot.data.root_state_w[:, 0:7]
+        self.ee_pose_w = self._robot.data.body_state_w[:, self.robot_entity_cfg.body_ids[0], 0:7]
+        self.ee_pos_b, self.ee_quat_b = _get_pose_b(self.ee_pose_w, self.base_pose_w)
+        self.valve_pose_w = self._valve.data.body_state_w[:, self.valve_link_idx, :7]
+        self.valve_pos_b, self.valve_quat_b = _get_pose_b(self.valve_pose_w, self.base_pose_w)
 
     def _compute_rewards(  # TODO
         self,
