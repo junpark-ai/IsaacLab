@@ -179,7 +179,7 @@ class FrankaValveEnvCfg(DirectRLEnvCfg):
     valve = ArticulationCfg(
         prim_path="/World/envs/env_.*/Valve",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=f"/home/kist-robot2/Desktop/round_valve_align/round_valve_align.usd",
+            usd_path=f"/home/kist-robot2/Desktop/round_valve_experiments/collision_experiments/round_only/round_only.usd",
             activate_contact_sensors=False,
         ),
         init_state=ArticulationCfg.InitialStateCfg(
@@ -554,7 +554,7 @@ class FrankaValveEnv(DirectRLEnv):
             torch.cat((robot_grasp_pos, robot_grasp_rot), dim=-1),
             torch.cat((valve_center_pos, valve_center_rot), dim=-1)
         )
-        d_xy = torch.norm(robot_grasp_pos_v[:, :-1], p=2, dim=-1) - 0.11  # radius = 0.11
+        d_xy = torch.norm(robot_grasp_pos_v[:, :-1], p=2, dim=-1) - 0.12  # radius = 0.12
         d_z = torch.abs(robot_grasp_pos_v[:, -1]) * 5
         d = d_xy ** 2 + d_z ** 2
         # d = torch.norm(robot_grasp_pos_v[:, -1], p=2, dim=-1)
@@ -603,7 +603,7 @@ class FrankaValveEnv(DirectRLEnv):
             dist_reward_scale * dist_reward
             + rot_reward_scale * rot_reward
             + open_reward_scale * open_reward
-            + finger_reward_scale * finger_dist_penalty
+            # + finger_reward_scale * finger_dist_penalty
             - action_penalty_scale * action_penalty
         )
 
