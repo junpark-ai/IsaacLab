@@ -81,7 +81,7 @@ gym.register(
 )
 
 gym.register(
-    id="Isaac-Franka-Valve-Direct-v0",
+    id="Isaac-Franka-Valve-Direct-v2",
     entry_point="omni.isaac.lab_tasks.direct.franka_cabinet:FrankaValveOnlyRotEnv",
     disable_env_checker=True,
     kwargs={
