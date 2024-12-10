@@ -25,6 +25,9 @@ from omni.isaac.lab.managers import EventTermCfg
 from omni.isaac.lab.managers import SceneEntityCfg
 from omni.isaac.lab.utils.math import subtract_frame_transforms, euler_xyz_from_quat, matrix_from_quat
 
+import roboticstoolbox as rtb
+from spatialmath import UnitQuaternion, SE3
+
 @configclass
 class EventCfg:
     # robot
@@ -66,18 +69,18 @@ class EventCfg:
         params={
             "asset_cfg": SceneEntityCfg("valve", body_names=".*"),
             "pose_range": {
-                "x": (0, 0),
-                "y": (0, 0),
-                "z": (0, 0),
-                "roll": (0, 0),
-                "pitch": (0, 0),  # 45 deg
-                "yaw": (0, 0),  # 20 deg
-                # "x": (-0.1, 0.1),
-                # "y": (-0.1, 0.1),
-                # "z": (-0.1, 0.1),
-                # "roll": (-0.349, 0.349),
-                # "pitch": (0, 1.57),  # 45 deg
-                # "yaw": (-0.349, 0.349),  # 20 deg
+                # "x": (0, 0),
+                # "y": (0, 0),
+                # "z": (0, 0),
+                # "roll": (0, 0),
+                # "pitch": (0, 0),  # 45 deg
+                # "yaw": (0, 0),  # 20 deg
+                "x": (-0.01, 0.01),
+                "y": (-0.01, 0.01),
+                "z": (-0.01, 0.01),
+                "roll": (-0.349, 0.349),
+                "pitch": (0, 1.57),  # 45 deg
+                "yaw": (-0.349, 0.349),  # 20 deg
             },
             "velocity_range": {}
         }
@@ -87,7 +90,8 @@ class EventCfg:
 @configclass
 class FrankaValveOnlyRotEnvCfg(DirectRLEnvCfg):
     # env
-    episode_length_s = 8.3333  # 500 timesteps
+    # episode_length_s = 8.3333  # 500 timesteps
+    episode_length_s = 3  # TODO
     decimation = 2
     action_space = 7  # 6 pose + 1 gripper
     observation_space = 14  # Robot pose (6) + Valve pose (6) + Gripper (2)
@@ -155,15 +159,15 @@ class FrankaValveOnlyRotEnvCfg(DirectRLEnvCfg):
                 joint_names_expr=["panda_joint[1-4]"],
                 effort_limit=87.0,
                 velocity_limit=2.175,
-                stiffness=80.0,
-                damping=4.0,
+                stiffness=400.0,
+                damping=40.0,
             ),
             "panda_forearm": ImplicitActuatorCfg(
                 joint_names_expr=["panda_joint[5-7]"],
                 effort_limit=12.0,
                 velocity_limit=2.61,
-                stiffness=80.0,
-                damping=4.0,
+                stiffness=400.0,
+                damping=40.0,
             ),
             "panda_hand": ImplicitActuatorCfg(
                 joint_names_expr=["panda_finger_joint.*"],
@@ -183,7 +187,7 @@ class FrankaValveOnlyRotEnvCfg(DirectRLEnvCfg):
             activate_contact_sensors=False,
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0, 0.4),
+            pos=(-0.1, 0, 0.4),  # TODO
             # rot=(0.0, 0.0, 0.0, 1.0),
             rot=(1, 0, 0, 0),
             # rot=(0.6532815, 0.2705981, -0.2705981, -0.6532815),  # (w, x, y, z)
@@ -221,7 +225,6 @@ class FrankaValveOnlyRotEnvCfg(DirectRLEnvCfg):
     action_scale = 7.5
     dof_velocity_scale = 0.1
 
-    # TODO
     # reward scales
     dist_reward_scale = 1.5
     rot_reward_scale = 3.0
@@ -235,6 +238,14 @@ def _get_pose_b(obj_w, base_w):
         base_w[:, 0:3], base_w[:, 3:7], obj_w[:, 0:3], obj_w[:, 3:7]
     )
     return obj_pos_b, obj_quat_b
+
+def matrix_from_pose(trans, quat):
+    n_envs = trans.shape[0]
+    T = SE3.Alloc(n_envs)
+    trans, quat = trans.cpu().numpy(), quat.cpu().numpy()
+    for i in range(n_envs):
+        T[i] = SE3(trans[i]) * UnitQuaternion(quat[i]).SE3()
+    return T
 
 
 class FrankaValveOnlyRotEnv(DirectRLEnv):
@@ -326,9 +337,12 @@ class FrankaValveOnlyRotEnv(DirectRLEnv):
         self.gripper_up_axis = torch.tensor([0, 1, 0], device=self.device, dtype=torch.float32).repeat(
             (self.num_envs, 1)
         )
-        # self.drawer_up_axis = torch.tensor([0, 0, 1], device=self.device, dtype=torch.float32).repeat(
+        # self.valve_grasp_pos = torch.tensor([0.085, 0.085, 0.1034], device=self.device, dtype=torch.float32).repeat(
         #     (self.num_envs, 1)
-        # )
+        # )  # TODO: Need to adjust it to a proper value
+        self.valve_grasp_pos = torch.tensor([0., 0., 0.1034], device=self.device, dtype=torch.float32).repeat(
+            (self.num_envs, 1)
+        )
 
         self.hand_link_idx = self._robot.find_bodies("panda_link7")[0][0]
         self.left_finger_link_idx = self._robot.find_bodies("panda_leftfinger")[0][0]
@@ -353,6 +367,22 @@ class FrankaValveOnlyRotEnv(DirectRLEnv):
 
         # self.cmd_limit = torch.tensor([0.1, 0.1, 0.1, 0.5, 0.5, 0.5], device=self.device)
         self.cmd_limit = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], device=self.device)
+
+        # TODO: Need to apply following variables
+        self.base_pose_w = torch.zeros(self.scene.num_envs, 7, device=self.device)
+        self.ee_pose_w = torch.zeros(self.scene.num_envs, 7, device=self.device)
+        self.ee_pos_b = torch.zeros(self.scene.num_envs, 3, device=self.device)
+        self.ee_quat_b = torch.zeros(self.scene.num_envs, 4, device=self.device)
+        self.valve_pose_w = torch.zeros(self.scene.num_envs, 7, device=self.device)
+        self.valve_pos_b = torch.zeros(self.scene.num_envs, 3, device=self.device)
+        self.valve_quat_b = torch.zeros(self.scene.num_envs, 4, device=self.device)
+
+        self.jacobian = torch.zeros(self.scene.num_envs, 6, 7, device=self.device)
+        self.joint_pos = torch.zeros(self.scene.num_envs, 7, device=self.device)
+
+        panda = rtb.models.Panda()
+        self.ets = panda.ets()
+
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
@@ -381,7 +411,8 @@ class FrankaValveOnlyRotEnv(DirectRLEnv):
         d_arm, d_gripper = self.actions[:, :-1], self.actions[:, -1]  # dpose
         d_arm *= self.cmd_limit
         torque_targets = self._compute_osc_torques(d_arm)
-        self.gripper_targets = torch.where(d_gripper > 0, 1, -1).unsqueeze(1).repeat(1, 2)
+        # self.gripper_targets = torch.where(d_gripper > 0, 1, -1).unsqueeze(1).repeat(1, 2)  # TODO
+        self.gripper_targets = torch.where(d_gripper > 0, 1, 1).unsqueeze(1).repeat(1, 2)
         # pos_targets = torch.concat([arm_targets, self.gripper_targets], -1)
         self.robot_pos_targets = torch.clamp(
             self.gripper_targets,
@@ -435,17 +466,19 @@ class FrankaValveOnlyRotEnv(DirectRLEnv):
             This function does not apply the joint targets to the simulation.
             It only fills the buffers with the desired values.
             To apply the joint targets, call the write_data_to_sim() function.  """
-        self._robot.set_joint_effort_target(target=self.robot_torque_targets, joint_ids=[i for i in range(7)])
+        # self._robot.set_joint_effort_target(target=self.robot_torque_targets, joint_ids=[i for i in range(7)])
         self._robot.set_joint_position_target(target=self.robot_pos_targets, joint_ids=[7, 8])
+        self._robot.set_joint_position_target(target=self.joint_pos, joint_ids=[i for i in range(7)])
 
     # post-physics step calls
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        terminated = self.valve_init_state - self._valve.data.joint_pos.squeeze(-1) > 1.57  # TODO
+        # terminated = self.valve_init_state - self._valve.data.joint_pos.squeeze(-1) > 1.57  # TODO
+        terminated = False
         truncated = self.episode_length_buf >= self.max_episode_length - 1
         return terminated, truncated
 
-    def _get_rewards(self) -> torch.Tensor:  # TODO
+    def _get_rewards(self) -> torch.Tensor:
         # Refresh the intermediate values after the physics steps
         self._compute_intermediate_values()
         robot_left_finger_pose = self._robot.data.body_state_w[:, self.left_finger_link_idx][:, :7]
@@ -480,6 +513,24 @@ class FrankaValveOnlyRotEnv(DirectRLEnv):
 
         # Need to refresh the intermediate values so that _get_observations() can use the latest values
         self._compute_intermediate_values(env_ids)
+
+        # Solve IK for grasp pose
+        # ee_mat = matrix_from_pose(self.ee_pos_b, self.ee_quat_b)
+        # self.valve_pos_b[env_ids, :] += self.valve_grasp_pos[env_ids, :]
+        des_mat = matrix_from_pose(self.valve_pos_b[env_ids, :], self.valve_quat_b[env_ids, :]) * SE3.Ry(torch.pi)
+        # des_mat = matrix_from_pose(self.valve_pos_b[env_ids, :], self.valve_quat_b[env_ids, :]) * SE3.Rz(-torch.pi/4) * SE3.Ry(torch.pi)
+        self.joint_pos = torch.from_numpy(self.ets.ikine_LM(des_mat, kq=10).q).float().to(self.device)
+        joint_vel = torch.zeros_like(self.joint_pos)
+        self._robot.set_joint_position_target(self.joint_pos, joint_ids=[i for i in range(7)], env_ids=env_ids)
+        self._robot.write_joint_state_to_sim(self.joint_pos, joint_vel, joint_ids=[i for i in range(7)], env_ids=env_ids)
+        torch.cuda.synchronize()
+
+        self._compute_intermediate_values(env_ids)
+        
+        # for i in range(len(env_ids)):
+        #     print((self.joint_pos[i, :] > self.robot_dof_lower_limits[:7]).all() and (self.joint_pos[i, :] < self.robot_dof_upper_limits[:7]).all())
+        # print()
+
 
     def _get_observations(self) -> dict:
         ee_pose_w = self._robot.data.body_state_w[:, self.robot_entity_cfg.body_ids[0], 0:7]
@@ -526,7 +577,20 @@ class FrankaValveOnlyRotEnv(DirectRLEnv):
             self.robot_local_grasp_pos[env_ids],
         )
 
-    def _compute_rewards(  # TODO
+        # TODO: Make other variables in the `_compute_osc_torques` function like this
+        self.jacobian = self._robot.root_physx_view.get_jacobians()[:, self.ee_jacobi_idx, :, self.robot_entity_cfg.joint_ids]
+        # self.joint_pos = self._robot.data.joint_pos[:, self.robot_entity_cfg.joint_ids]
+
+        # For trajectory planning
+        self.base_pose_w = self._robot.data.root_state_w[:, 0:7]
+        self.ee_pose_w = self._robot.data.body_state_w[:, self.robot_entity_cfg.body_ids[0], 0:7]
+        self.ee_pos_b, self.ee_quat_b = _get_pose_b(self.ee_pose_w, self.base_pose_w)
+        self.valve_pose_w = self._valve.data.body_state_w[:, self.valve_link_idx, :7]
+        grasp_pos_w = tf_vector(self.valve_center_rot, self.valve_grasp_pos[env_ids, :])
+        self.valve_pose_w[:, :3] += grasp_pos_w  # TODO
+        self.valve_pos_b, self.valve_quat_b = _get_pose_b(self.valve_pose_w, self.base_pose_w)
+
+    def _compute_rewards(
         self,
         actions,
         valve_dof_pos,
@@ -565,7 +629,7 @@ class FrankaValveOnlyRotEnv(DirectRLEnv):
 
         axis1 = tf_vector(robot_grasp_rot, gripper_forward_axis)
         axis2 = tf_vector(valve_center_rot, valve_inward_axis)
-        # axis3 = tf_vector(robot_grasp_rot, gripper_up_axis)  # TODO: Make gripper_up_axis normal to valve
+        # axis3 = tf_vector(robot_grasp_rot, gripper_up_axis)
         # axis4 = tf_vector(drawer_grasp_rot, drawer_up_axis)
 
         dot1 = (
