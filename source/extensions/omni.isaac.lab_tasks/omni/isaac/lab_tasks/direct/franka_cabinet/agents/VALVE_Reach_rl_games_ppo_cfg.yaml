@@ -34,6 +34,11 @@ params:
         name: default
       regularizer:
         name: None
+#    rnn:
+#      name: lstm
+#      units: 32
+#      layers: 1
+#      seq_length: 30
 
   load_checkpoint: False # flag which sets whether to load the checkpoint
   load_path: '' # path to the checkpoint to load
