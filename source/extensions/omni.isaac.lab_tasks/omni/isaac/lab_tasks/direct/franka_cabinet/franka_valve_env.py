@@ -408,8 +408,7 @@ class FrankaValveEnv(DirectRLEnv):
         kp_null = torch.tensor([10.] * 7, device=self.device)
         kd_null = 2 * torch.sqrt(kp_null)
         ee_vel_w = self._robot.root_physx_view.get_link_velocities()[:, self.ee_jacobi_idx + 1, :]
-        # base_rotm_w = matrix_from_quat(self._robot.data.root_state_w[:, 3:7])
-        base_rotm_w = matrix_from_quat(self._robot.data.body_quat_w[:, self.ee_jacobi_idx + 1, :])
+        base_rotm_w = matrix_from_quat(self._robot.data.root_state_w[:, 3:7])
         ee_vel_lin_b = (base_rotm_w @ ee_vel_w[:, :3].unsqueeze(-1)).squeeze(-1)
         ee_vel_ang_b = (base_rotm_w @ ee_vel_w[:, 3:].unsqueeze(-1)).squeeze(-1)
         ee_vel_b = torch.cat((ee_vel_lin_b, ee_vel_ang_b), dim=-1)
