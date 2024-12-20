@@ -26,7 +26,8 @@ from omni.isaac.lab.utils.math import sample_uniform
 from omni.isaac.lab.controllers import DifferentialIKController, DifferentialIKControllerCfg
 from omni.isaac.lab.managers import EventTermCfg
 from omni.isaac.lab.managers import SceneEntityCfg
-from omni.isaac.lab.utils.math import subtract_frame_transforms, euler_xyz_from_quat, matrix_from_quat, apply_delta_pose, combine_frame_transforms, quat_from_euler_xyz, quat_rotate_inverse
+from omni.isaac.lab.utils.math import (subtract_frame_transforms, matrix_from_quat, combine_frame_transforms,
+                                       quat_from_euler_xyz, quat_rotate_inverse, skew_symmetric_matrix)
 
 @configclass
 class EventCfg:
@@ -97,13 +98,22 @@ class EventCfg:
     )
 
 
+# controller = "OSC"
+controller = "IK"
+
 @configclass
 class FrankaValveReachEnvCfg(DirectRLEnvCfg):
     # env
     episode_length_s = 6.0  # 360 timesteps
     decimation = 2
-    action_space = 6  # delta pose (6)
-    observation_space = 41  # ee pose (7) + valve grasp/center pose (14) + robot joint pos/vel (14) + previous action (6)
+    if controller == "OSC":
+        # OSC
+        action_space = 6  # delta pose (6)  # TODO
+        observation_space = 21  # ee pose (7) + valve grasp/center pose (14)
+    if controller == "IK":
+        # IK
+        action_space = 6  # delta pose (6)  # TODO
+        observation_space = 41  # ee pose (7) + valve grasp/center pose (14) + robot joint pos/vel (14) + previous action (6)
     state_space = 0
 
     # simulation
@@ -130,7 +140,6 @@ class FrankaValveReachEnvCfg(DirectRLEnvCfg):
     robot = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.UsdFileCfg(
-            # usd_path=f"{ISAAC_NUCLEUS_DIR}/Robots/Franka/franka_instanceable.usd",
             usd_path=f"{ISAAC_NUCLEUS_DIR}/IsaacLab/Robots/FrankaEmika/panda_instanceable.usd",
             activate_contact_sensors=False,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -168,15 +177,15 @@ class FrankaValveReachEnvCfg(DirectRLEnvCfg):
                 joint_names_expr=["panda_joint[1-4]"],
                 effort_limit=87.0,
                 velocity_limit=2.175,
-                stiffness=80.0,
-                damping=4.0,
+                stiffness=400.0,  # TODO
+                damping=40.0,  # TODO
             ),
             "panda_forearm": ImplicitActuatorCfg(
                 joint_names_expr=["panda_joint[5-7]"],
                 effort_limit=12.0,
                 velocity_limit=2.61,
-                stiffness=80.0,
-                damping=4.0,
+                stiffness=400.0,  # TODO
+                damping=40.0,  # TODO
             ),
             "panda_hand": ImplicitActuatorCfg(
                 joint_names_expr=["panda_finger_joint.*"],
@@ -197,9 +206,7 @@ class FrankaValveReachEnvCfg(DirectRLEnvCfg):
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(-0.1, 0, 0.4),
-            # rot=(0.0, 0.0, 0.0, 1.0),
             rot=(1, 0, 0, 0),
-            # rot=(0.6532815, 0.2705981, -0.2705981, -0.6532815),  # (w, x, y, z)
             joint_pos={
                 "valve_joint": 0.0,
             },
@@ -234,22 +241,28 @@ class FrankaValveReachEnvCfg(DirectRLEnvCfg):
     action_scale = 7.5
     dof_velocity_scale = 0.1
 
-    # TODO
     # reward scales
     dist_reward_scale = 1.5
     rot_reward_scale = 0.05
     open_penalty_scale = 0.4
     action_penalty_scale = 0.01
-    finger_reward_scale = 2.0
 
     valve_radius = 0.12
 
 
 def _get_pose_b(obj_w, base_w):
     obj_pos_b, obj_quat_b = subtract_frame_transforms(
-        base_w[:, 0:3], base_w[:, 3:7], obj_w[:, 0:3], obj_w[:, 3:7]
+        base_w[:, :3], base_w[:, 3:], obj_w[:, :3], obj_w[:, 3:]
     )
-    return obj_pos_b, obj_quat_b
+    obj_pose_b = torch.cat((obj_pos_b, obj_quat_b), dim=-1)
+    return obj_pose_b
+
+def _combine_pose(pose1, pose2):
+    combined_pos, combined_quat = combine_frame_transforms(
+        pose1[:, :3], pose1[:, 3:], pose2[:, :3], pose2[:, 3:]
+    )
+    combined_pose = torch.cat((combined_pos, combined_quat), dim=-1)
+    return combined_pose
 
 def is_in_forbidden_range(theta, forbidden_ranges):
     for start, end in forbidden_ranges:
@@ -273,98 +286,42 @@ class FrankaValveReachEnv(DirectRLEnv):
     def __init__(self, cfg: FrankaValveReachEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
-        def get_env_local_pose(env_pos: torch.Tensor, xformable: UsdGeom.Xformable, device: torch.device):
-            """Compute pose in env-local coordinates"""
-            world_transform = xformable.ComputeLocalToWorldTransform(0)
-            world_pos = world_transform.ExtractTranslation()
-            world_quat = world_transform.ExtractRotationQuat()
-
-            px = world_pos[0] - env_pos[0]
-            py = world_pos[1] - env_pos[1]
-            pz = world_pos[2] - env_pos[2]
-            qx = world_quat.imaginary[0]
-            qy = world_quat.imaginary[1]
-            qz = world_quat.imaginary[2]
-            qw = world_quat.real
-
-            return torch.tensor([px, py, pz, qw, qx, qy, qz], device=device)
-
         self.dt = self.cfg.sim.dt * self.cfg.decimation
 
         # create auxiliary variables for computing applied action, observations and rewards
         self.robot_dof_lower_limits = self._robot.data.soft_joint_pos_limits[0, :, 0].to(device=self.device)
         self.robot_dof_upper_limits = self._robot.data.soft_joint_pos_limits[0, :, 1].to(device=self.device)
 
-        self.robot_dof_speed_scales = torch.ones_like(self.robot_dof_lower_limits)
-        self.robot_dof_speed_scales[self._robot.find_joints("panda_finger_joint1")[0]] = 0.1
-        self.robot_dof_speed_scales[self._robot.find_joints("panda_finger_joint2")[0]] = 0.1
-
-        self.robot_dof_targets = torch.zeros((self.num_envs, self._robot.num_joints), device=self.device)
-
-        stage = get_current_stage()
-        # NOTE: 'local_pose' is a fixed frame in the environment.
-        hand_pose = get_env_local_pose(
-            self.scene.env_origins[0],
-            UsdGeom.Xformable(stage.GetPrimAtPath("/World/envs/env_0/Robot/panda_link7")),
-            self.device,
-        )
-        lfinger_pose = get_env_local_pose(
-            self.scene.env_origins[0],
-            UsdGeom.Xformable(stage.GetPrimAtPath("/World/envs/env_0/Robot/panda_leftfinger")),
-            self.device,
-        )
-        rfinger_pose = get_env_local_pose(
-            self.scene.env_origins[0],
-            UsdGeom.Xformable(stage.GetPrimAtPath("/World/envs/env_0/Robot/panda_rightfinger")),
-            self.device,
-        )
-
-        # NOTE: 'finger_pose' is a transformation from "world" to "finger"
-        finger_pose = torch.zeros(7, device=self.device)
-        finger_pose[0:3] = (lfinger_pose[0:3] + rfinger_pose[0:3]) / 2.0  # NOTE: Isn't it useless?
-        finger_pose[3:7] = lfinger_pose[3:7]
-        # NOTE: 'hand_pose_inv' is a transformation from "hand" to "world"
-        hand_pose_inv_rot, hand_pose_inv_pos = tf_inverse(hand_pose[3:7], hand_pose[0:3])
-
-        # NOTE: "hand" to "world" + "world" to "finger" => "hand" to "finger"
-        robot_local_grasp_pose_rot, robot_local_grasp_pose_pos = tf_combine(
-            hand_pose_inv_rot, hand_pose_inv_pos, finger_pose[3:7], finger_pose[0:3]
-        )
-        robot_local_grasp_pose_pos += torch.tensor([0, 0, 0.04], device=self.device)
-        self.robot_local_grasp_pos = robot_local_grasp_pose_pos.repeat((self.num_envs, 1))
-        self.robot_local_grasp_rot = robot_local_grasp_pose_rot.repeat((self.num_envs, 1))
-
-        valve_local_center_pose = torch.tensor([0.0, 0.0, 0.15, 1.0, 0.0, 0.0, 0.0], device=self.device)
-        self.valve_local_center_pos = valve_local_center_pose[0:3].repeat((self.num_envs, 1))
-        self.valve_local_center_rot = valve_local_center_pose[3:7].repeat((self.num_envs, 1))
-
-        self.gripper_forward_axis = torch.tensor([0, 0, 1], device=self.device, dtype=torch.float32).repeat(
+        self.hand2ee_pose = torch.tensor([0, 0, 0.107, 1, 0, 0, 0], device=self.device, dtype=torch.float32).repeat(
             (self.num_envs, 1)
         )
-        self.valve_inward_axis = torch.tensor([0, 0, -1], device=self.device, dtype=torch.float32).repeat(
+        self.gripper_forward_axis = torch.tensor([0, 0, 1], device=self.device, dtype=torch.float32).repeat(
             (self.num_envs, 1)
         )
         self.gripper_roll_axis = torch.tensor([1, 0, 0], device=self.device, dtype=torch.float32).repeat(
             (self.num_envs, 1)
         )
-        # self.drawer_up_axis = torch.tensor([0, 0, 1], device=self.device, dtype=torch.float32).repeat(
-        #     (self.num_envs, 1)
-        # )
 
-        self.hand_link_idx = self._robot.find_bodies("panda_link7")[0][0]
-        self.left_finger_link_idx = self._robot.find_bodies("panda_leftfinger")[0][0]
-        self.right_finger_link_idx = self._robot.find_bodies("panda_rightfinger")[0][0]
+        self.hand_link_idx = self._robot.find_bodies("panda_hand")[0][0]
         self.valve_link_idx = self._valve.find_bodies("valve")[0][0]
 
-        self.robot_grasp_rot = torch.zeros((self.num_envs, 4), device=self.device)
-        self.robot_grasp_pos = torch.zeros((self.num_envs, 3), device=self.device)
-        self.valve_center_rot = torch.zeros((self.num_envs, 4), device=self.device)
-        self.valve_center_pos = torch.zeros((self.num_envs, 3), device=self.device)
-        self.valve_grasp_pose_v = torch.zeros((self.num_envs, 7), device=self.device)
+        self.valve_pose_w = torch.zeros(self.scene.num_envs, 7, device=self.device)
+        self.valve_pose_b = torch.zeros(self.scene.num_envs, 7, device=self.device)
+        self.valve_center_pose_w = torch.zeros((self.num_envs, 7), device=self.device)
+        self.valve_center_pose_b = torch.zeros((self.num_envs, 7), device=self.device)
         self.valve_grasp_pose_w = torch.zeros((self.num_envs, 7), device=self.device)
         self.valve_grasp_pose_b = torch.zeros((self.num_envs, 7), device=self.device)
-
+        self.valve_grasp_pose_v = torch.zeros((self.num_envs, 7), device=self.device)
         self.valve_init_state = torch.zeros((self.num_envs, 1), device=self.device)
+
+        self.base_pose_w = torch.zeros(self.scene.num_envs, 7, device=self.device)
+        self.ee_pose_w = torch.zeros(self.scene.num_envs, 7, device=self.device)
+        self.ee_pose_b = torch.zeros(self.scene.num_envs, 7, device=self.device)
+        self.ee_vel_w = torch.zeros(self.scene.num_envs, 6, device=self.device)
+
+        self.jacobian = torch.zeros(self.scene.num_envs, 6, 7, device=self.device)
+        self.joint_pos = torch.zeros(self.scene.num_envs, 7, device=self.device)
+        self.actions = torch.zeros(self.scene.num_envs, self.cfg.action_space, device=self.device)
 
         # For OSC controller
         self.robot_entity_cfg = SceneEntityCfg("robot", joint_names=["panda_joint.*"], body_names=["panda_hand"])
@@ -373,27 +330,18 @@ class FrankaValveReachEnv(DirectRLEnv):
             self.ee_jacobi_idx = self.robot_entity_cfg.body_ids[0] - 1
         else:
             self.ee_jacobi_idx = self.robot_entity_cfg.body_ids[0]
+        self.robot_pos_targets = torch.zeros(self.scene.num_envs, 2, device=self.device)
+        self.robot_torque_targets = torch.zeros(self.scene.num_envs, 7, device=self.device)
 
         # For IK controller
         self.diff_ik_cfg = DifferentialIKControllerCfg(command_type="pose", use_relative_mode=True, ik_method="dls")
         self.diff_ik_controller = DifferentialIKController(self.diff_ik_cfg, num_envs=self.scene.num_envs, device=self.device)
         self.ik_commands = torch.zeros(self.scene.num_envs, self.diff_ik_controller.action_dim, device=self.device)
+        self.robot_dof_targets = torch.zeros((self.num_envs, self._robot.num_joints), device=self.device)
 
-        # self.cmd_limit = torch.tensor([0.1, 0.1, 0.1, 0.5, 0.5, 0.5], device=self.device)
         self.cmd_limit = torch.tensor([0.5, 0.5, 0.5, 1.0, 1.0, 1.0], device=self.device)
         # self.cmd_limit = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], device=self.device)
 
-        # TODO: Need to apply following variables
-        self.base_pose_w = torch.zeros(self.scene.num_envs, 7, device=self.device)
-        self.ee_pose_w = torch.zeros(self.scene.num_envs, 7, device=self.device)
-        self.ee_pos_b = torch.zeros(self.scene.num_envs, 3, device=self.device)
-        self.ee_quat_b = torch.zeros(self.scene.num_envs, 4, device=self.device)
-        self.valve_pose_w = torch.zeros(self.scene.num_envs, 7, device=self.device)
-        self.valve_pos_b = torch.zeros(self.scene.num_envs, 3, device=self.device)
-        self.valve_quat_b = torch.zeros(self.scene.num_envs, 4, device=self.device)
-
-        self.jacobian = torch.zeros(self.scene.num_envs, 6, 7, device=self.device)
-        self.joint_pos = torch.zeros(self.scene.num_envs, 7, device=self.device)
 
 
     def _setup_scene(self):
@@ -427,76 +375,78 @@ class FrankaValveReachEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor):
         """ Pre-process actions before stepping through the physics.
             It is called before the physics stepping (which is decimated).  """
-        # # OSC
-        # self.actions = actions.clone()
-        # d_arm = self.actions[:]
-        # # d_arm, d_gripper = self.actions[:, :-1], self.actions[:, -1]  # dpose
-        # d_arm *= self.cmd_limit
-        # torque_targets = self._compute_osc_torques(d_arm)
-        # self.gripper_targets = torch.where(d_arm[:, -1] > 0, 1, 1).unsqueeze(1).repeat(1, 2)
-        # # pos_targets = torch.concat([arm_targets, self.gripper_targets], -1)
-        # self.robot_pos_targets = torch.clamp(
-        #     self.gripper_targets,
-        #     self.robot_dof_lower_limits[-2:], self.robot_dof_upper_limits[-2:]
-        # )
-        # self.robot_torque_targets = torch.clamp(
-        #     torque_targets,
-        #     -torch.tensor([87] * 4 + [12] * 3).to(self.device), torch.tensor([87] * 4 + [12] * 3).to(self.device)
-        # )
-        # # self.robot_torque_targets[:, :-2] = torque_targets
+        if controller == "OSC":
+            # OSC
+            self.actions[:] = actions.clone()
+            d_arm, d_gripper = self.actions[:], self.actions[:, -1]  # TODO
+            # d_arm, d_gripper = self.actions[:, :-1], self.actions[:, -1]
+            d_arm *= self.cmd_limit
+            torque_targets = self._custom_controller(d_arm)
+            gripper_targets = torch.where(d_gripper > 0, 1, 1).unsqueeze(1).repeat(1, 2)  # TODO
+            # gripper_targets = torch.where(d_gripper > 0, 1, 0).unsqueeze(1).repeat(1, 2)
+            # pos_targets = torch.concat([arm_targets, gripper_targets], -1)
+            self.robot_pos_targets[:] = torch.clamp(
+                gripper_targets,
+                self.robot_dof_lower_limits[-2:], self.robot_dof_upper_limits[-2:]
+            )
+            self.robot_torque_targets[:] = torch.clamp(
+                torque_targets,
+                -torch.tensor([87] * 4 + [12] * 3).to(self.device), torch.tensor([87] * 4 + [12] * 3).to(self.device)
+            )
+        if controller == "IK":
+            # IK
+            self.actions[:] = actions.clone()
+            d_arm, d_gripper = self.actions[:], self.actions[:, -1]  # TODO
+            # d_arm, d_gripper = self.actions[:, :-1], self.actions[:, -1]
+            d_arm *= self.cmd_limit
+            arm_targets = self._custom_controller(d_arm)
+            gripper_targets = torch.where(d_gripper > 0, 1, 1).unsqueeze(1).repeat(1, 2)  # TODO
+            # gripper_targets = torch.where(d_gripper > 0, 1, 0).unsqueeze(1).repeat(1, 2)
+            targets = torch.concat([arm_targets, gripper_targets], -1)
+            self.robot_dof_targets[:] = torch.clamp(targets, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
 
-        # IK
-        self.actions = actions.clone()
-        d_arm, d_gripper = self.actions[:], self.actions[:, -1]  # dpose
-        d_arm *= self.cmd_limit
-        arm_targets = self._compute_osc_torques(d_arm)
-        self.gripper_targets = torch.where(d_gripper > 0, 1, 1).unsqueeze(1).repeat(1,2)
-        targets = torch.concat([arm_targets, self.gripper_targets], -1)
-        self.robot_dof_targets[:] = torch.clamp(targets, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
 
+    def _custom_controller(self, dpose):
+        if controller == "OSC":
+            # OSC
+            q = self._robot.data.joint_pos[:, :7]
+            qd = self._robot.data.joint_vel[:, :7]
+            mm = self._robot.root_physx_view.get_mass_matrices()[:, :7, :7]
+            mm_inv = torch.inverse(mm)
+            m_eef_inv = self.jacobian @ mm_inv @ torch.transpose(self.jacobian, 1, 2)
+            m_eef = torch.inverse(m_eef_inv)
 
-    def _compute_osc_torques(self, dpose):
-        # OSC
-        # q = self._robot.data.joint_pos[:, :7]
-        # qd = self._robot.data.joint_vel[:, :7]
-        # j_eef = self._robot.root_physx_view.get_jacobians()[:, self.ee_jacobi_idx, :, self.robot_entity_cfg.joint_ids]
-        # mm = self._robot.root_physx_view.get_mass_matrices()[:, :7, :7]
-        # mm_inv = torch.inverse(mm)
-        # m_eef_inv = j_eef @ mm_inv @ torch.transpose(j_eef, 1, 2)
-        # m_eef = torch.inverse(m_eef_inv)
-        #
-        # # Transform our cartesian action `dpose` into joint torques `u`
-        # kp = torch.tensor([150.] * 6, device=self.device)
-        # kd = 2 * torch.sqrt(kp)
-        # kp_null = torch.tensor([0.] * 7, device=self.device)
-        # kd_null = 2 * torch.sqrt(kp_null)
-        # ee_vel_w = self._robot.root_physx_view.get_link_velocities()[:, self.ee_jacobi_idx + 1, :]
-        # # base_rotm_w = matrix_from_quat(self._robot.data.root_state_w[:, 3:7])
-        # base_rotm_w = matrix_from_quat(self._robot.data.body_quat_w[:, self.ee_jacobi_idx + 1, :])
-        # ee_vel_lin_b = (base_rotm_w @ ee_vel_w[:, :3].unsqueeze(-1)).squeeze(-1)
-        # ee_vel_ang_b = (base_rotm_w @ ee_vel_w[:, 3:].unsqueeze(-1)).squeeze(-1)
-        # ee_vel_b = torch.cat((ee_vel_lin_b, ee_vel_ang_b), dim=-1)
-        # u = torch.transpose(j_eef, 1, 2) @ m_eef @ (
-        #         kp * dpose - kd * ee_vel_b).unsqueeze(-1)
-        #
-        # # Nullspace control torques `u_null` prevents large changes in joint configuration
-        # # They are added into the nullspace of OSC so that the end effector orientation remains constant
-        # # roboticsproceedings.org/rss07/p31.pdf
-        # j_eef_inv = m_eef @ j_eef @ mm_inv
-        # u_null = kd_null * -qd + kp_null * (
-        #         (self._robot.data.default_joint_pos[0, :7] - q + torch.pi) % (2 * torch.pi) - torch.pi)
-        # u_null[:, 7:] *= 0
-        # u_null = mm @ u_null.unsqueeze(-1)
-        # u += (torch.eye(7, device=self.device).unsqueeze(0) - torch.transpose(j_eef, 1, 2) @ j_eef_inv) @ u_null
-        #
-        # return u.squeeze(-1)
+            # Transform our cartesian action `dpose` into joint torques `u`
+            kp = torch.tensor([150.] * 6, device=self.device)
+            kd = 2 * torch.sqrt(kp)
+            kp_null = torch.tensor([10.] * 7, device=self.device)
+            kd_null = 2 * torch.sqrt(kp_null)
+            base_rotm_w = matrix_from_quat(self._robot.data.root_state_w[:, 3:7])
+            ee_vel_lin_b = (base_rotm_w @ self.ee_vel_w[:, :3].unsqueeze(-1)).squeeze(-1)
+            ee_vel_ang_b = (base_rotm_w @ self.ee_vel_w[:, 3:].unsqueeze(-1)).squeeze(-1)
+            ee_vel_b = torch.cat((ee_vel_lin_b, ee_vel_ang_b), dim=-1)
+            u = torch.transpose(self.jacobian, 1, 2) @ m_eef @ (
+                    kp * dpose - kd * ee_vel_b).unsqueeze(-1)
 
-        # IK
-        # compute the joint commands
-        self.diff_ik_controller.reset()
-        self.diff_ik_controller.set_command(dpose, self.ee_pos_b, self.ee_quat_b)
-        joint_pos_des = self.diff_ik_controller.compute(self.ee_pos_b, self.ee_quat_b, self.jacobian, self.joint_pos)
-        return joint_pos_des
+            # Nullspace control torques `u_null` prevents large changes in joint configuration
+            # They are added into the nullspace of OSC so that the end effector orientation remains constant
+            # roboticsproceedings.org/rss07/p31.pdf
+            j_eef_inv = m_eef @ self.jacobian @ mm_inv
+            u_null = kd_null * -qd + kp_null * (
+                    (self._robot.data.default_joint_pos[0, :7] - q + torch.pi) % (2 * torch.pi) - torch.pi)
+            u_null[:, 7:] *= 0
+            u_null = mm @ u_null.unsqueeze(-1)
+            u += (torch.eye(7, device=self.device).unsqueeze(0) - torch.transpose(self.jacobian, 1, 2) @ j_eef_inv) @ u_null
+
+            return u.squeeze(-1)
+
+        if controller == "IK":
+            # IK
+            # compute the joint commands
+            self.diff_ik_controller.reset()
+            self.diff_ik_controller.set_command(dpose, self.ee_pose_b[:, :3], self.ee_pose_b[:, 3:])
+            joint_pos_des = self.diff_ik_controller.compute(self.ee_pose_b[:, :3], self.ee_pose_b[:, 3:], self.jacobian, self.joint_pos)
+            return joint_pos_des
 
 
     def _apply_action(self):
@@ -506,12 +456,14 @@ class FrankaValveReachEnv(DirectRLEnv):
             This function does not apply the joint targets to the simulation.
             It only fills the buffers with the desired values.
             To apply the joint targets, call the write_data_to_sim() function.  """
-        # OSC
-        # self._robot.set_joint_effort_target(target=self.robot_torque_targets, joint_ids=[i for i in range(7)])
-        # self._robot.set_joint_position_target(target=self.robot_pos_targets, joint_ids=[7, 8])
+        if controller == "OSC":
+            # OSC
+            self._robot.set_joint_effort_target(target=self.robot_torque_targets, joint_ids=[i for i in range(7)])
+            self._robot.set_joint_position_target(target=self.robot_pos_targets, joint_ids=[7, 8])
 
-        # IK
-        self._robot.set_joint_position_target(self.robot_dof_targets)
+        if controller == "IK":
+            # IK
+            self._robot.set_joint_position_target(self.robot_dof_targets)
 
     # post-physics step calls
 
@@ -521,35 +473,24 @@ class FrankaValveReachEnv(DirectRLEnv):
         truncated = self.episode_length_buf >= self.max_episode_length - 1
         return terminated, truncated
 
-    def _get_rewards(self) -> torch.Tensor:  # TODO
+    def _get_rewards(self) -> torch.Tensor:
         # Refresh the intermediate values after the physics steps
         self._compute_intermediate_values()
-        robot_left_finger_pose = self._robot.data.body_state_w[:, self.left_finger_link_idx][:, :7]
-        robot_right_finger_pose = self._robot.data.body_state_w[:, self.right_finger_link_idx][:, :7]
 
         return self._compute_rewards(
             self.actions,
             self._valve.data.joint_pos,
             self.valve_init_state,
-            self.robot_grasp_pos,
-            self.robot_grasp_rot,
-            self.valve_center_pos,
-            self.valve_center_rot,
+            self.ee_pose_w,
             self.valve_grasp_pose_w,
-            robot_left_finger_pose,
-            robot_right_finger_pose,
             self.gripper_forward_axis,
-            self.valve_inward_axis,
             self.gripper_roll_axis,
-            # self.drawer_up_axis,
             self.num_envs,
             self.cfg.dist_reward_scale,
             self.cfg.rot_reward_scale,
             self.cfg.open_penalty_scale,
             self.cfg.action_penalty_scale,
-            self.cfg.finger_reward_scale,
-            self._robot.data.joint_pos,
-            self.ee_pos_b,
+            self.ee_pose_b[:, :3],
         )
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -582,55 +523,42 @@ class FrankaValveReachEnv(DirectRLEnv):
         self.valve_grasp_pose_v[env_ids, 0] = torch.cos(grasp_theta) * self.cfg.valve_radius
         self.valve_grasp_pose_v[env_ids, 1] = torch.sin(grasp_theta) * self.cfg.valve_radius
         self.valve_grasp_pose_v[env_ids, 3:] = quat_from_euler_xyz(torch.zeros_like(grasp_theta), torch.pi * torch.ones_like(grasp_theta), grasp_theta - torch.pi / 2)
-        # self.valve_grasp_pose_v[env_ids, 3:] = quat_from_euler_xyz(torch.zeros_like(grasp_theta), torch.zeros_like(grasp_theta), torch.zeros_like(grasp_theta))
 
         # Need to refresh the intermediate values so that _get_observations() can use the latest values
         self.init = 1  # TODO
         self._compute_intermediate_values(env_ids)
 
     def _get_observations(self) -> dict:
-        # OSC
-        # ee_pos_b, ee_quat_b = _get_pose_b(torch.cat((self.robot_grasp_pos, self.robot_grasp_rot), dim=-1), self.base_pose_w)
-        # # TODO: Consider the valve perception through camera
-        # valve_grasp_pos_b, valve_grasp_quat_b = _get_pose_b(self.valve_grasp_pose_w, self.base_pose_w)
-        # valve_center_pos_b, valve_center_quat_b = _get_pose_b(torch.cat((self.valve_center_pos, self.valve_center_rot), dim=-1), self.base_pose_w)
-        #
-        # ee_vel = self._robot.data.body_vel_w[:, self._robot.data.body_names.index('panda_hand'), :3]
-        #
-        # obs = torch.cat(
-        #     (
-        #         ee_pos_b,                                                   # 3
-        #         ee_quat_b,                                                  # 4
-        #         # torch.stack(euler_xyz_from_quat(ee_quat_b)).T,              # 3
-        #         valve_grasp_pos_b,                                          # 3
-        #         valve_grasp_quat_b,                                         # 4
-        #         # torch.stack(euler_xyz_from_quat(valve_grasp_quat_b)).T,     # 3
-        #         # valve_center_pos_b,                                         # 3
-        #
-        #         quat_rotate_inverse(self.base_pose_w[:, 3:], ee_vel)        # 3
-        #
-        #         # self._robot.data.joint_pos[:, -2:]                  # 2
-        #     ),
-        #     dim=-1,
-        # )
+        # Markers
+        self.ee_marker.visualize(self.ee_pose_w[:, :3], self.ee_pose_w[:, 3:])
+        self.goal_marker.visualize(self.valve_grasp_pose_w[:, :3], self.valve_grasp_pose_w[:, 3:])
+        self.valve_marker.visualize(self.valve_center_pose_w[:, :3], self.valve_center_pose_w[:, 3:])
 
-        # IK
-        ee_pos_b, ee_quat_b = _get_pose_b(torch.cat((self.robot_grasp_pos, self.robot_grasp_rot), dim=-1), self.base_pose_w)
-        # TODO: Consider the valve perception through camera
-
-        obs = torch.cat(
-            (
-                ee_pos_b,                                                               # 3
-                ee_quat_b,                                                              # 4
-                self._robot.data.joint_pos[:, self.robot_entity_cfg.joint_ids],         # 7
-                self._robot.data.joint_vel[:, self.robot_entity_cfg.joint_ids],         # 7
-                self.valve_grasp_pose_b,                                                # 7
-                self.actions,                                                           # 6
-                self.valve_center_pos_b,                                                # 3
-                self.valve_center_quat_b                                                # 4
-            ),
-            dim=-1,
-        )
+        if controller == "OSC":
+            # OSC
+            obs = torch.cat(
+                (
+                    self.ee_pose_b,                                                         # 7
+                    self.valve_grasp_pose_b,                                                # 7
+                    self.valve_center_pose_b,                                               # 7
+                    # quat_rotate_inverse(self.base_pose_w[:, 3:], self.ee_vel_w[:, :3]),     # 3
+                    # self._robot.data.joint_pos[:, -2:],                                     # 2
+                ),
+                dim=-1,
+            )
+        if controller == "IK":
+            # IK
+            obs = torch.cat(
+                (
+                    self.ee_pose_b,                                                         # 7
+                    self.valve_grasp_pose_b,                                                # 7
+                    self.valve_center_pose_b,                                               # 7
+                    self._robot.data.joint_pos[:, self.robot_entity_cfg.joint_ids],         # 7
+                    self._robot.data.joint_vel[:, self.robot_entity_cfg.joint_ids],         # 7
+                    self.actions,                                                           # 6
+                ),
+                dim=-1,
+            )
 
         """ A dictionary should be returned that contains policy as the key,
             and the full observation buffer as the value.
@@ -644,98 +572,66 @@ class FrankaValveReachEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self._robot._ALL_INDICES
 
-        hand_pos = self._robot.data.body_pos_w[env_ids, self.hand_link_idx]
-        hand_rot = self._robot.data.body_quat_w[env_ids, self.hand_link_idx]
-        # NOTE: Following outputs are transformations from "world" frame.
-        (
-            self.robot_grasp_rot[env_ids],
-            self.robot_grasp_pos[env_ids],
-            self.valve_center_rot[env_ids],
-            self.valve_center_pos[env_ids],  # TODO
-        ) = self._compute_grasp_transforms(
-            hand_rot,
-            hand_pos,
-            self.robot_local_grasp_rot[env_ids],
-            self.robot_local_grasp_pos[env_ids],
-        )
+        self.valve_center_pose_w[env_ids] = self._valve.data.body_state_w[env_ids, self.valve_link_idx, :7]
 
-        # TODO: Make other variables in the `_compute_osc_torques` function like this
-        self.jacobian[:] = self._robot.root_physx_view.get_jacobians()[:, self.ee_jacobi_idx, :, self.robot_entity_cfg.joint_ids]
-        self.joint_pos[:] = self._robot.data.joint_pos[:, self.robot_entity_cfg.joint_ids]
+        self.jacobian[env_ids] = self._robot.root_physx_view.get_jacobians()[env_ids][:, self.ee_jacobi_idx, :, self.robot_entity_cfg.joint_ids]
+        self.jacobian[env_ids, :3, :] += torch.bmm(skew_symmetric_matrix(self.hand2ee_pose[env_ids, :3]), self.jacobian[env_ids, 3:, :])
+        self.jacobian[env_ids, 3:, :] = torch.bmm(matrix_from_quat(self.hand2ee_pose[env_ids, 3:]), self.jacobian[env_ids, 3:, :])
+        self.joint_pos[env_ids] = self._robot.data.joint_pos[env_ids][:, self.robot_entity_cfg.joint_ids]
 
-        # For trajectory planning
-        self.base_pose_w[:] = self._robot.data.root_state_w[:, 0:7]
-        self.ee_pose_w[:] = self._robot.data.body_state_w[:, self.robot_entity_cfg.body_ids[0], 0:7]
-        self.ee_pos_b[:], self.ee_quat_b[:] = _get_pose_b(self.ee_pose_w, self.base_pose_w)
-        self.valve_pose_w[:] = self._valve.data.body_state_w[:, self.valve_link_idx, :7]
-        # grasp_pos_w = tf_vector(self.valve_center_rot, self.valve_grasp_pos[env_ids, :])
-        # self.valve_pose_w[:, :3] += grasp_pos_w  # TODO
-
-        self.valve_grasp_pose_w[:] = torch.cat(
-            combine_frame_transforms(
-                self.valve_pose_w[:, :3], self.valve_pose_w[:, 3:],
-                self.valve_grasp_pose_v[:, :3], self.valve_grasp_pose_v[:, 3:],
-            ),
-            dim=-1
-        )
-        # self.valve_pose_w[:] = torch.cat(
-        #     apply_delta_pose(self.valve_pose_w[:, :3], self.valve_pose_w[:, 3:], self.valve_grasp_pose_v), dim=-1
-        # )
-        self.valve_pos_b[:], self.valve_quat_b[:] = _get_pose_b(self.valve_pose_w, self.base_pose_w)
+        self.base_pose_w[env_ids] = self._robot.data.root_state_w[env_ids, :7]
+        hand_pose_w = self._robot.data.body_state_w[env_ids, self.hand_link_idx, :7]
+        self.ee_pose_w[env_ids] = _combine_pose(hand_pose_w, self.hand2ee_pose[env_ids])
+        self.ee_pose_b[env_ids] = _get_pose_b(self.ee_pose_w[env_ids], self.base_pose_w[env_ids])
+        self.valve_pose_w[env_ids] = self._valve.data.body_state_w[env_ids, self.valve_link_idx, :7]
+        self.valve_pose_b[env_ids] = _get_pose_b(self.valve_pose_w[env_ids], self.base_pose_w[env_ids])
+        self.valve_grasp_pose_w[env_ids] = _combine_pose(self.valve_pose_w[env_ids], self.valve_grasp_pose_v[env_ids])
+        
         if self.init:
-            self.valve_grasp_pose_b[:, :3], self.valve_grasp_pose_b[:, 3:] = _get_pose_b(self.valve_grasp_pose_w, self.base_pose_w)
-            self.valve_center_pos_b, self.valve_center_quat_b = _get_pose_b(  # TODO: Initialize
-                torch.cat((self.valve_center_pos, self.valve_center_rot), dim=-1), self.base_pose_w)
+            self.valve_grasp_pose_b[env_ids] = _get_pose_b(self.valve_grasp_pose_w[env_ids], self.base_pose_w[env_ids])
+            self.valve_center_pose_b[env_ids] = _get_pose_b(
+                self.valve_center_pose_w[env_ids], self.base_pose_w[env_ids])
             self.init = 0
 
-        # Markers
-        self.ee_marker.visualize(self.robot_grasp_pos[:], self.robot_grasp_rot[:])
-        # self.ee_marker.visualize(self.ee_pose_w[:, 0:3], self.ee_pose_w[:, 3:7])
-        self.goal_marker.visualize(self.valve_grasp_pose_w[:, 0:3], self.valve_grasp_pose_w[:, 3:7])
-        self.valve_marker.visualize(self.valve_center_pos, self.valve_center_rot)
+        hand_vel_w = self._robot.root_physx_view.get_link_velocities()[env_ids, self.hand_link_idx, :]
+        lin_vel_offset = torch.cross(
+            hand_vel_w[:, 3:], tf_vector(hand_pose_w[env_ids, 3:], self.hand2ee_pose[env_ids, :3])
+        )
+        self.ee_vel_w[env_ids, :3] = hand_vel_w[:, :3] + lin_vel_offset[:, :3]
+        self.ee_vel_w[env_ids, 3:] = hand_vel_w[:, 3:]
 
-    def _compute_rewards(  # TODO
+    def _compute_rewards(
         self,
         actions,
         valve_dof_pos,
         valve_init_state,
-        robot_grasp_pos,
-        robot_grasp_rot,
-        valve_center_pos,
-        valve_center_rot,
+        ee_pose,
         valve_grasp_pose,
-        robot_lfinger_pose,
-        robot_rfinger_pose,
         gripper_forward_axis,
-        valve_inward_axis,
         gripper_roll_axis,
-        # drawer_up_axis,
         num_envs,
         dist_reward_scale,
         rot_reward_scale,
         open_penalty_scale,
         action_penalty_scale,
-        finger_reward_scale,
-        joint_positions,
         ee_pos_b,
     ):
 
-        d = torch.norm(robot_grasp_pos - valve_grasp_pose[:, :3], dim=-1)
+        d = torch.norm(ee_pose[:, :3] - valve_grasp_pose[:, :3], dim=-1)
         dist_reward = 1 - torch.tanh(10.0 * d)
 
-        axis1 = tf_vector(robot_grasp_rot, gripper_roll_axis)
-        axis2 = tf_vector(valve_grasp_pose[:, 3:7], gripper_roll_axis)
-        axis3 = tf_vector(robot_grasp_rot, gripper_forward_axis)
-        axis4 = tf_vector(valve_grasp_pose[:, 3:7], gripper_forward_axis)
+        axis1 = tf_vector(ee_pose[:, 3:], gripper_roll_axis)
+        axis2 = tf_vector(valve_grasp_pose[:, 3:], gripper_roll_axis)
+        axis3 = tf_vector(ee_pose[:, 3:], gripper_forward_axis)
+        axis4 = tf_vector(valve_grasp_pose[:, 3:], gripper_forward_axis)
 
-        dot1 = (
+        dot1 = (  # alignment of roll(x) axis for gripper
             torch.bmm(axis1.view(num_envs, 1, 3), axis2.view(num_envs, 3, 1)).squeeze(-1).squeeze(-1)
-        )  # alignment of forward axis for gripper
-        dot2 = (
+        )
+        dot2 = (  # alignment of forward axis for gripper
             torch.bmm(axis3.view(num_envs, 1, 3), axis4.view(num_envs, 3, 1)).squeeze(-1).squeeze(-1)
-        )  # alignment of up axis for gripper
-        # reward for matching the orientation of the hand to the drawer (fingers wrapped)
-        # rot_reward = 1.0 * (torch.sign(dot1) * dot1**2)
+        )
+        # reward for matching the orientation of the hand to the valve
         rot_reward = (0.7 * torch.sign(dot1) * dot1**2
                     + 0.3 * torch.sign(dot2) * dot2**2)
 
@@ -744,62 +640,21 @@ class FrankaValveReachEnv(DirectRLEnv):
 
         # how far the valve has been rotated
         open_penalty = torch.abs((valve_dof_pos - valve_init_state).squeeze(-1))
-        # open_reward = valve_init_state - valve_dof_pos.squeeze(-1)
-
-        # # # penalty for distance of each finger from the drawer handle
-        # robot_lfinger_pos_v, _ = _get_pose_b(
-        #     robot_lfinger_pose,
-        #     torch.cat((valve_center_pos, valve_center_rot), dim=-1)
-        # )
-        # robot_rfinger_pos_v, _ = _get_pose_b(
-        #     robot_rfinger_pose,
-        #     torch.cat((valve_center_pos, valve_center_rot), dim=-1)
-        # )
-        # lfinger_dist = torch.norm(robot_lfinger_pos_v[:, :2], p=2, dim=-1) - self.cfg.valve_radius
-        # rfinger_dist = self.cfg.valve_radius - torch.norm(robot_rfinger_pos_v[:, :2], p=2, dim=-1)
-        # finger_dist_penalty = torch.zeros_like(lfinger_dist)
-        # finger_dist_penalty += torch.where(lfinger_dist < 0, lfinger_dist, torch.zeros_like(lfinger_dist))
-        # finger_dist_penalty += torch.where(rfinger_dist < 0, rfinger_dist, torch.zeros_like(rfinger_dist))
 
         rewards = (
             dist_reward_scale * dist_reward
             + rot_reward_scale * rot_reward
             - open_penalty_scale * open_penalty
-            # + finger_reward_scale * finger_dist_penalty
-            # - action_penalty_scale * action_penalty
+            - action_penalty_scale * action_penalty
         )
 
-        # rewards = torch.where(ee_pos_b[:, 0] < 0, rewards - 0.25, rewards)
+        rewards = torch.where(ee_pos_b[:, 0] < 0, rewards - 0.1, rewards)
 
         self.extras["log"] = {
             "dist_reward": (dist_reward_scale * dist_reward).mean(),
             "rot_reward": (rot_reward_scale * rot_reward).mean(),
             "open_penalty": (-open_penalty_scale * open_penalty).mean(),
             "action_penalty": (-action_penalty_scale * action_penalty).mean(),
-            # "left_finger_dist": (finger_reward_scale * lfinger_dist).mean(),
-            # "right_finger_dist": (finger_reward_scale * rfinger_dist).mean(),
-            # "finger_dist_penalty": (finger_reward_scale * finger_dist_penalty).mean(),
         }
 
         return rewards
-
-    def _compute_grasp_transforms(
-        self,
-        hand_rot,
-        hand_pos,
-        robot_local_grasp_rot,
-        robot_local_grasp_pos,
-    ):
-        # NOTE: 'hand_pose' = "world" to "hand", 'robot_local_grasp_pose' = "hand" to "finger"
-        # NOTE: So we can make "world" to "finger" transformation using `tf_combine` function.
-        robot_global_rot, robot_global_pos = tf_combine(
-            hand_rot, hand_pos, robot_local_grasp_rot, robot_local_grasp_pos
-        )
-        # valve_global_rot, valve_global_pos = tf_combine(  # TODO
-        #     hand_rot, hand_pos, robot_local_grasp_rot, robot_local_grasp_pos
-        # )
-
-        return (robot_global_rot,
-                robot_global_pos,
-                self._valve.data.body_quat_w[:, self.valve_link_idx],
-                self._valve.data.body_pos_w[:, self.valve_link_idx])
