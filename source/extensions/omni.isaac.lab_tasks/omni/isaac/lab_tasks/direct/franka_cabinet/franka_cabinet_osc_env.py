@@ -24,6 +24,13 @@ from omni.isaac.lab.utils.math import sample_uniform
 from omni.isaac.lab.controllers import OperationSpaceController, OperationSpaceControllerCfg
 from omni.isaac.lab.managers import SceneEntityCfg
 from omni.isaac.lab.utils.math import subtract_frame_transforms, quat_from_euler_xyz, euler_xyz_from_quat, matrix_from_quat
+from omni.isaac.lab.sensors import ContactSensorCfg, ContactSensor
+
+# @configclass
+# class SensorsSceneCfg(InteractiveSceneCfg):
+#     contact_forces = ContactSensorCfg(
+#         prim_path="{ENV_REGEX_NS}/Robot/.*finger", update_period=0.0, history_length=6, debug_vis=True
+#     )
 
 
 @configclass
@@ -52,12 +59,16 @@ class FrankaCabinetOSCEnvCfg(DirectRLEnvCfg):
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=3.0, replicate_physics=True)
 
+    # contact_sensor: ContactSensorCfg = ContactSensorCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/panda_leftfinger", update_period=0.0, history_length=6, debug_vis=True
+    # )
+
     # robot
     robot = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{ISAAC_NUCLEUS_DIR}/Robots/Franka/franka_instanceable.usd",
-            activate_contact_sensors=False,
+            activate_contact_sensors=True,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
                 max_depenetration_velocity=5.0,
@@ -118,7 +129,7 @@ class FrankaCabinetOSCEnvCfg(DirectRLEnvCfg):
         prim_path="/World/envs/env_.*/Cabinet",
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Sektion_Cabinet/sektion_cabinet_instanceable.usd",
-            activate_contact_sensors=False,
+            activate_contact_sensors=True,
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 0, 0.4),
@@ -296,8 +307,10 @@ class FrankaCabinetOSCEnv(DirectRLEnv):
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
         self._cabinet = Articulation(self.cfg.cabinet)
+        # self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
         self.scene.articulations["robot"] = self._robot
         self.scene.articulations["cabinet"] = self._cabinet
+        # self.scene.sensors["contact_sensor"] = self._contact_sensor
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -345,8 +358,7 @@ class FrankaCabinetOSCEnv(DirectRLEnv):
         kp_null = torch.tensor([10.] * 7, device=self.device)
         kd_null = 2 * torch.sqrt(kp_null)
         ee_vel_w = self._robot.root_physx_view.get_link_velocities()[:, self.ee_jacobi_idx + 1, :]
-        # base_rotm_w = matrix_from_quat(self._robot.data.root_state_w[:, 3:7])
-        base_rotm_w = matrix_from_quat(self._robot.data.body_quat_w[:, self.ee_jacobi_idx + 1, :])
+        base_rotm_w = matrix_from_quat(self._robot.data.root_state_w[:, 3:7])
         ee_vel_lin_b = (base_rotm_w @ ee_vel_w[:, :3].unsqueeze(-1)).squeeze(-1)
         ee_vel_ang_b = (base_rotm_w @ ee_vel_w[:, 3:].unsqueeze(-1)).squeeze(-1)
         ee_vel_b = torch.cat((ee_vel_lin_b, ee_vel_ang_b), dim=-1)
