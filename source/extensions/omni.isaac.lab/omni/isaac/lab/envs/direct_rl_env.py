@@ -192,7 +192,8 @@ class DirectRLEnv(gym.Env):
         # perform events at the start of the simulation
         if self.cfg.events:
             if "startup" in self.event_manager.available_modes:
-                self.event_manager.apply(mode="startup")
+                indices = torch.arange(self.num_envs, dtype=torch.int64, device=self.device)
+                self.event_manager.apply(mode="startup", env_ids=indices)
 
         # -- set the framerate of the gym video recorder wrapper so that the playback speed of the produced video matches the simulation
         self.metadata["render_fps"] = 1 / self.step_dt

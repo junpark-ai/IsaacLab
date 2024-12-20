@@ -151,7 +151,7 @@ class OperationSpaceController:
             self.cfg.damping_ratio_limits[1],
         )
         # -- storing outputs
-        self._desired_torques = torch.zeros(self.num_robots, self.num_dof, self.num_dof, device=self._device)
+        self._desired_torques = torch.zeros(self.num_robots, self.num_dof, device=self._device)
 
     """
     Properties.
@@ -262,7 +262,7 @@ class OperationSpaceController:
         desired_ee_rot = None
         desired_ee_force = None
         # resolve the commands
-        target_groups = torch.split(self._task_space_target, self.target_list)
+        target_groups = torch.split(self._task_space_target, self.target_list, -1)
         for command_type, target in zip(self.cfg.command_types, target_groups):
             if command_type == "position_rel":
                 # check input is provided
@@ -312,7 +312,7 @@ class OperationSpaceController:
             )
             velocity_error = -ee_vel  # zero target velocity
             # -- desired end-effector acceleration (spring damped system)
-            des_ee_acc = self._p_gains * pose_error + self._d_gains * velocity_error
+            des_ee_acc = self._p_gains * torch.cat(pose_error, dim=-1) + self._d_gains * velocity_error
             # -- inertial compensation
             if self.cfg.inertial_compensation:
                 # check input is provided
@@ -331,15 +331,15 @@ class OperationSpaceController:
                     des_motion_wrench = torch.cat(decoupled_force, decoupled_torque)
                 else:
                     # coupled dynamics
-                    lambda_full = torch.inverse(jacobian @ mass_matrix_inv * jacobian.T)
+                    lambda_full = torch.inverse(jacobian @ mass_matrix_inv @ jacobian.permute(0,2,1))
                     # desired end-effector wrench (from pseudo-dynamics)
-                    des_motion_wrench = lambda_full @ des_ee_acc
+                    des_motion_wrench = (lambda_full @ des_ee_acc.unsqueeze(-1)).squeeze(-1)
             else:
                 # task-space impedance control
                 # wrench = \ddot(x_des)
                 des_motion_wrench = des_ee_acc
             # -- joint-space wrench
-            self._desired_torques += jacobian.T @ self._selection_matrix_motion @ des_motion_wrench
+            self._desired_torques += (jacobian.permute(0,2,1) @ self._selection_matrix_motion @ des_motion_wrench.unsqueeze(-1)).squeeze(-1)
 
         # compute for force control
         if desired_ee_force is not None:
@@ -354,7 +354,7 @@ class OperationSpaceController:
                 # open-loop control
                 des_force_wrench = desired_ee_force
             # -- joint-space wrench
-            self._desired_torques += jacobian.T @ self._selection_matrix_force @ des_force_wrench
+            self._desired_torques += jacobian.permute(0,2,1) @ self._selection_matrix_force @ des_force_wrench
 
         # add gravity compensation (bias correction)
         if self.cfg.gravity_compensation:
